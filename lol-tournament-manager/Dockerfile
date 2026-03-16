@@ -9,7 +9,7 @@ COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
 
 COPY frontend/ ./
-RUN npm run build -- --outDir /app/static
+RUN npm run build -- --outDir /app/static15
 
 
 # ──────────────────────────────────────────────────────────────
@@ -24,16 +24,13 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt ./
-RUN pip install --no-cache-dir \
-    fastapi>=0.110.0 \
-    uvicorn[standard]>=0.29.0 \
-    httpx>=0.25.0
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend source
 COPY *.py ./
 
 # Copy pre-built frontend from stage 1
-COPY --from=frontend-build /app/static ./static
+COPY --from=frontend-build /app/static15 ./static15
 
 # Data volume: the SQLite database lives here so it persists across restarts
 VOLUME /app/data
