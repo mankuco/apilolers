@@ -119,30 +119,20 @@ def fetch_player_rank(name_tag: str) -> dict | None:
         r.raise_for_status()
         puuid = r.json()["puuid"]
 
-        # Step 2 – get summoner ID via Summoner-v4
-        summ_url = (
-            f"https://{platform}.api.riotgames.com"
-            f"/lol/summoner/v4/summoners/by-puuid/{puuid}"
-        )
-        log.info("Riot lookup step 2: %s", summ_url)
-        r2 = httpx.get(summ_url, headers=headers, timeout=timeout)
-        if r2.status_code == 403:
-            return {"error": "API key lacks summoner-v4 access (403)."}
-        if r2.status_code == 404:
-            return {"error": f"Summoner not found on platform '{platform}'. Wrong region?"}
-        r2.raise_for_status()
-        summoner_id = r2.json()["id"]
-
-        # Step 3 – get ranked data via League-v4
+        # Step 2 – get ranked data via League-v4 (by PUUID, no summoner ID needed)
         league_url = (
             f"https://{platform}.api.riotgames.com"
-            f"/lol/league/v4/entries/by-summoner/{summoner_id}"
+            f"/lol/league/v4/entries/by-puuid/{puuid}"
         )
-        log.info("Riot lookup step 3: %s", league_url)
-        r3 = httpx.get(league_url, headers=headers, timeout=timeout)
-        r3.raise_for_status()
+        log.info("Riot lookup step 2: %s", league_url)
+        r2 = httpx.get(league_url, headers=headers, timeout=timeout)
+        if r2.status_code == 403:
+            return {"error": "API key lacks league-v4 access (403)."}
+        if r2.status_code == 404:
+            return {"error": f"No ranked data found for this player on '{platform}'."}
+        r2.raise_for_status()
 
-        for entry in r3.json():
+        for entry in r2.json():
             if entry["queueType"] == "RANKED_SOLO_5x5":
                 tier = entry["tier"]
                 div = entry["rank"]

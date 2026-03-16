@@ -255,12 +255,14 @@ def _migrate(conn: sqlite3.Connection):
     if "end_date" not in j_cols:
         cur.execute("ALTER TABLE jornadas ADD COLUMN end_date TEXT")
 
-    # Add start_date/end_date to seasons
+    # Add start_date/end_date/archived to seasons
     s_cols = {row[1] for row in cur.execute("PRAGMA table_info(seasons)").fetchall()}
     if "start_date" not in s_cols:
         cur.execute("ALTER TABLE seasons ADD COLUMN start_date TEXT")
     if "end_date" not in s_cols:
         cur.execute("ALTER TABLE seasons ADD COLUMN end_date TEXT")
+    if "archived" not in s_cols:
+        cur.execute("ALTER TABLE seasons ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     # Backfill last_played for players who have matches but null last_played
     cur.execute("""
@@ -901,9 +903,13 @@ def get_active_season(db_path: str = DB_PATH) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def get_all_seasons(db_path: str = DB_PATH) -> list[dict]:
+def get_all_seasons(include_archived: bool = False, db_path: str = DB_PATH) -> list[dict]:
     conn = get_connection(db_path)
-    rows = conn.execute("SELECT * FROM seasons ORDER BY id DESC").fetchall()
+    q = "SELECT * FROM seasons"
+    if not include_archived:
+        q += " WHERE archived = 0"
+    q += " ORDER BY id DESC"
+    rows = conn.execute(q).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -918,6 +924,55 @@ def get_season(season_id: int, db_path: str = DB_PATH) -> Optional[dict]:
 def close_season(season_id: int, db_path: str = DB_PATH):
     conn = get_connection(db_path)
     conn.execute("UPDATE seasons SET status = 'finished', ended_at = datetime('now') WHERE id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def archive_season(season_id: int, db_path: str = DB_PATH):
+    """Archive a finished season (soft-hide from default views)."""
+    conn = get_connection(db_path)
+    conn.execute("UPDATE seasons SET archived = 1 WHERE id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def unarchive_season(season_id: int, db_path: str = DB_PATH):
+    conn = get_connection(db_path)
+    conn.execute("UPDATE seasons SET archived = 0 WHERE id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_season(season_id: int, db_path: str = DB_PATH):
+    """Permanently delete a season, its jornadas, jornada_matches links, and awards."""
+    conn = get_connection(db_path)
+    # Unlink matches from jornadas of this season
+    conn.execute("""
+        UPDATE matches SET jornada_id = NULL
+        WHERE jornada_id IN (SELECT id FROM jornadas WHERE season_id = ?)
+    """, (season_id,))
+    # Delete jornada_matches links
+    conn.execute("""
+        DELETE FROM jornada_matches
+        WHERE jornada_id IN (SELECT id FROM jornadas WHERE season_id = ?)
+    """, (season_id,))
+    # Delete jornadas
+    conn.execute("DELETE FROM jornadas WHERE season_id = ?", (season_id,))
+    # Delete awards
+    conn.execute("DELETE FROM season_awards WHERE season_id = ?", (season_id,))
+    # Delete season
+    conn.execute("DELETE FROM seasons WHERE id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_jornada(jornada_id: int, db_path: str = DB_PATH):
+    """Delete a jornada and unlink its matches."""
+    conn = get_connection(db_path)
+    # Unlink matches
+    conn.execute("UPDATE matches SET jornada_id = NULL WHERE jornada_id = ?", (jornada_id,))
+    conn.execute("DELETE FROM jornada_matches WHERE jornada_id = ?", (jornada_id,))
+    conn.execute("DELETE FROM jornadas WHERE id = ?", (jornada_id,))
     conn.commit()
     conn.close()
 
@@ -1129,6 +1184,64 @@ def get_season_match_ids(season_id: int, db_path: str = DB_PATH) -> list[int]:
     """, (season_id,)).fetchall()
     conn.close()
     return [r["match_id"] for r in rows]
+
+
+def get_player_season_stats(season_id: int, db_path: str = DB_PATH) -> dict:
+    """
+    Compute per-player stats for a specific season (from matches linked to its jornadas).
+    Returns {player_id: {wins, losses, games, mvps, aces, elo_start, elo_end, elo_diff}}.
+    """
+    conn = get_connection(db_path)
+
+    # Get all matches for this season
+    match_rows = conn.execute("""
+        SELECT m.id, m.team_blue, m.team_red, m.winner,
+               m.mvp_player_id, m.ace_player_id, m.elo_changes
+        FROM matches m
+        JOIN jornada_matches jm ON jm.match_id = m.id
+        JOIN jornadas j ON j.id = jm.jornada_id
+        WHERE j.season_id = ? AND m.archived = 0
+        ORDER BY m.id ASC
+    """, (season_id,)).fetchall()
+
+    # Get elo_inicio_temporada for all active players
+    player_rows = conn.execute("SELECT id, elo_inicio_temporada FROM players WHERE active = 1").fetchall()
+    conn.close()
+
+    stats = {}
+    for pr in player_rows:
+        stats[pr["id"]] = {
+            "wins": 0, "losses": 0, "games": 0,
+            "mvps": 0, "aces": 0,
+            "elo_start": pr["elo_inicio_temporada"] or 1200,
+        }
+
+    for m in match_rows:
+        blue_ids = json.loads(m["team_blue"])
+        red_ids = json.loads(m["team_red"])
+        winner = m["winner"]
+        mvp_id = m["mvp_player_id"]
+        ace_id = m["ace_player_id"]
+        winning_ids = set(blue_ids if winner == "Blue" else red_ids)
+        all_ids = set(blue_ids + red_ids)
+
+        for pid in all_ids:
+            if pid not in stats:
+                stats[pid] = {
+                    "wins": 0, "losses": 0, "games": 0,
+                    "mvps": 0, "aces": 0, "elo_start": 1200,
+                }
+            stats[pid]["games"] += 1
+            if pid in winning_ids:
+                stats[pid]["wins"] += 1
+            else:
+                stats[pid]["losses"] += 1
+            if pid == mvp_id:
+                stats[pid]["mvps"] += 1
+            if pid == ace_id:
+                stats[pid]["aces"] += 1
+
+    return stats
 
 
 # ── 1v1 Duel System ───────────────────────────────────────────────────────

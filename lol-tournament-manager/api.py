@@ -54,7 +54,7 @@ balancer = MatchBalancer()
 
 # Try latest build dir first, fall back to older ones
 _base = os.path.dirname(os.path.abspath(__file__))
-_candidates = ["static13", "static12", "static11", "static10", "static9", "static8", "static7", "static6", "static5", "static4", "static3", "static2", "static"]
+_candidates = ["static15", "static14", "static13", "static12", "static11", "static10", "static9", "static8", "static7", "static6", "static5", "static4", "static3", "static2", "static"]
 STATIC_DIR = next(
     (os.path.join(_base, d) for d in _candidates if os.path.isdir(os.path.join(_base, d))),
     os.path.join(_base, "static"),
@@ -218,10 +218,33 @@ def test_riot_key():
 # ── Players ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/players")
-def list_players(active_only: bool = True):
+def list_players(active_only: bool = True, season_id: Optional[int] = None):
     players = db.get_all_players(active_only=active_only)
     for p in players:
         p["power_ranking"] = round(p["tournament_elo"], 2)
+
+    if season_id is not None:
+        # Overlay season-specific stats on top of player data
+        season_stats = db.get_player_season_stats(season_id)
+        for p in players:
+            ss = season_stats.get(p["id"])
+            if ss:
+                p["season_games"] = ss["games"]
+                p["season_wins"] = ss["wins"]
+                p["season_losses"] = ss["losses"]
+                p["season_mvps"] = ss["mvps"]
+                p["season_aces"] = ss["aces"]
+                p["season_elo_start"] = round(ss["elo_start"], 1)
+                p["season_elo_diff"] = round(p["tournament_elo"] - ss["elo_start"], 1)
+            else:
+                p["season_games"] = 0
+                p["season_wins"] = 0
+                p["season_losses"] = 0
+                p["season_mvps"] = 0
+                p["season_aces"] = 0
+                p["season_elo_start"] = round(p.get("elo_inicio_temporada") or p["tournament_elo"], 1)
+                p["season_elo_diff"] = 0
+
     return players
 
 
@@ -1393,9 +1416,13 @@ class LinkMatchJornadaRequest(BaseModel):
     jornada_id: int
 
 
+class DeleteWithPasswordRequest(BaseModel):
+    password: str
+
+
 @app.get("/api/seasons")
-def list_seasons():
-    return db.get_all_seasons()
+def list_seasons(include_archived: bool = False):
+    return db.get_all_seasons(include_archived=include_archived)
 
 
 @app.get("/api/seasons/active")
@@ -1420,6 +1447,51 @@ def close_season(season_id: int):
         raise HTTPException(404, "Season not found")
     db.close_season(season_id)
     return {"message": f"Season '{s['name']}' closed"}
+
+
+@app.post("/api/seasons/{season_id}/archive")
+def archive_season(season_id: int):
+    s = db.get_season(season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+    if s["status"] == "active":
+        raise HTTPException(400, "Cannot archive an active season. Close it first.")
+    db.archive_season(season_id)
+    return {"message": f"Season '{s['name']}' archived"}
+
+
+@app.post("/api/seasons/{season_id}/unarchive")
+def unarchive_season(season_id: int):
+    s = db.get_season(season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+    db.unarchive_season(season_id)
+    return {"message": f"Season '{s['name']}' restored"}
+
+
+@app.post("/api/seasons/{season_id}/delete")
+def delete_season(season_id: int, req: DeleteWithPasswordRequest):
+    if req.password != "apilolers2026":
+        raise HTTPException(403, "Wrong password")
+    s = db.get_season(season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+    if s["status"] == "active":
+        raise HTTPException(400, "Cannot delete an active season. Close it first.")
+    name = s["name"]
+    db.delete_season(season_id)
+    return {"message": f"Season '{name}' permanently deleted"}
+
+
+@app.delete("/api/jornadas/{jornada_id}")
+def delete_jornada_endpoint(jornada_id: int):
+    j = db.get_jornada(jornada_id)
+    if not j:
+        raise HTTPException(404, "Jornada not found")
+    if j["closed"]:
+        raise HTTPException(400, "Cannot delete a closed jornada")
+    db.delete_jornada(jornada_id)
+    return {"message": "Jornada deleted"}
 
 
 @app.post("/api/jornadas")

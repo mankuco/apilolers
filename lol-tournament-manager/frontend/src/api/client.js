@@ -13,8 +13,11 @@ async function request(path, options = {}) {
 }
 
 // ── Players ──────────────────────────────────────────────
-export const getPlayers = (activeOnly = true) =>
-  request(`/players?active_only=${activeOnly}`)
+export const getPlayers = (activeOnly = true, seasonId = null) => {
+  let url = `/players?active_only=${activeOnly}`
+  if (seasonId) url += `&season_id=${seasonId}`
+  return request(url)
+}
 
 export const getPlayer = (id) => request(`/players/${id}`)
 
@@ -116,7 +119,8 @@ export const getDuelStats = () => request('/duels/stats')
 export const getEloFormula = () => request('/elo/formula')
 
 // ── Seasons & Jornadas ──────────────────────────────────
-export const getSeasons = () => request('/seasons')
+export const getSeasons = (includeArchived = false) =>
+  request(`/seasons?include_archived=${includeArchived}`)
 
 export const getActiveSeason = () => request('/seasons/active')
 
@@ -125,6 +129,15 @@ export const createSeason = (name, startDate = null, endDate = null) =>
 
 export const closeSeason = (seasonId) =>
   request(`/seasons/${seasonId}/close`, { method: 'POST' })
+
+export const archiveSeason = (seasonId) =>
+  request(`/seasons/${seasonId}/archive`, { method: 'POST' })
+
+export const unarchiveSeason = (seasonId) =>
+  request(`/seasons/${seasonId}/unarchive`, { method: 'POST' })
+
+export const deleteSeason = (seasonId, password) =>
+  request(`/seasons/${seasonId}/delete`, { method: 'POST', body: JSON.stringify({ password }) })
 
 export const createJornada = (seasonId, name = '', startDate = null, endDate = null) =>
   request('/jornadas', { method: 'POST', body: JSON.stringify({ season_id: seasonId, name, start_date: startDate, end_date: endDate }) })
@@ -139,6 +152,9 @@ export const linkMatchToJornada = (matchId, jornadaId) =>
 
 export const closeJornada = (jornadaId) =>
   request(`/jornadas/${jornadaId}/close`, { method: 'POST' })
+
+export const deleteJornada = (jornadaId) =>
+  request(`/jornadas/${jornadaId}`, { method: 'DELETE' })
 
 // ── Season Awards ───────────────────────────────────────
 export const computeSeasonAwards = (seasonId) =>

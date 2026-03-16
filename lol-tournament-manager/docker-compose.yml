@@ -11,8 +11,7 @@ services:
       - tournament-data:/app/data
     environment:
       - DB_PATH=/app/data/tournament.db
-      # Optional: set your Riot API key here
-      - RIOT_API_KEY=RGAPI-c6fd7d5b-e3fa-4423-88e4-3d72b79a7440
+      - RIOT_API_KEY=${RIOT_API_KEY}
 
 volumes:
   tournament-data:

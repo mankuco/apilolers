@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Trophy, Users, Gamepad2, TrendingUp, UserPlus, Swords, ChevronDown, ChevronUp, Archive, Zap, Clock } from 'lucide-react'
+import { Trophy, Users, Gamepad2, TrendingUp, UserPlus, Swords, ChevronDown, ChevronUp, Archive, Zap, Clock, Filter } from 'lucide-react'
 import StatCard from '../components/StatCard'
 import Badge from '../components/Badge'
 import ChampionIcon from '../components/ChampionIcon'
@@ -65,7 +65,6 @@ function EloSparkline({ history }) {
   })
 
   const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
-  // Gradient fill area
   const areaD = `${pathD} L ${points[points.length - 1].x.toFixed(1)} ${H} L ${points[0].x.toFixed(1)} ${H} Z`
 
   const lastVal = values[values.length - 1]
@@ -83,7 +82,6 @@ function EloSparkline({ history }) {
         </defs>
         <path d={areaD} fill="url(#eloGrad)" />
         <path d={pathD} fill="none" stroke={trending ? '#34d399' : '#f87171'} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-        {/* Data points */}
         {points.map((p, i) => (
           <circle key={i} cx={p.x} cy={p.y} r="3"
             fill={trending ? '#34d399' : '#f87171'} stroke="#1a1a2e" strokeWidth="1.5"
@@ -91,7 +89,6 @@ function EloSparkline({ history }) {
           />
         ))}
       </svg>
-      {/* Labels */}
       <div className="flex justify-between text-[10px] font-mono mt-1">
         <span className="text-surface-500">Match 1: {Math.round(firstVal)}</span>
         <span className={trending ? 'text-emerald-400' : 'text-red-400'}>
@@ -125,14 +122,65 @@ function formatLastPlayed(dateStr) {
 
 export default function LadderPage() {
   const navigate = useNavigate()
-  const { data: players, loading, refetch } = useApi(() => api.getPlayers(true))
-  const { data: overview } = useApi(() => api.getOverview())
   const [showAdd, setShowAdd] = useState(false)
   const [expandedId, setExpandedId] = useState(null)
   const [playerStats, setPlayerStats] = useState({})
   const [sortBy, setSortBy] = useState('elo') // 'elo' or 'power'
 
+  // Season filter
+  const [seasons, setSeasons] = useState([])
+  const [activeSeason, setActiveSeason] = useState(null)
+  const [selectedSeason, setSelectedSeason] = useState('active') // 'all' | 'active' | season id
+  const [players, setPlayers] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  const { data: overview } = useApi(() => api.getOverview())
+
+  // Load seasons on mount
+  useEffect(() => {
+    async function loadSeasons() {
+      try {
+        const [all, active] = await Promise.all([api.getSeasons(), api.getActiveSeason()])
+        setSeasons(all)
+        if (active.active) {
+          setActiveSeason(active.season)
+          setSelectedSeason('active')
+        } else {
+          setSelectedSeason('all')
+        }
+      } catch {}
+    }
+    loadSeasons()
+  }, [])
+
+  // Load players when season changes
+  useEffect(() => {
+    async function loadPlayers() {
+      setLoading(true)
+      try {
+        let seasonId = null
+        if (selectedSeason === 'active' && activeSeason) {
+          seasonId = activeSeason.id
+        } else if (selectedSeason !== 'all' && selectedSeason !== 'active') {
+          seasonId = parseInt(selectedSeason)
+        }
+        const data = await api.getPlayers(true, seasonId)
+        setPlayers(data)
+      } catch (e) {
+        console.error(e)
+      }
+      setLoading(false)
+    }
+    loadPlayers()
+  }, [selectedSeason, activeSeason])
+
+  const isSeasonView = selectedSeason !== 'all'
+
   const sortedPlayers = players ? [...players].sort((a, b) => {
+    if (isSeasonView) {
+      // In season view, sort by season elo diff descending
+      return (b.season_elo_diff || 0) - (a.season_elo_diff || 0)
+    }
     if (sortBy === 'power') {
       const pa = a.power_ranking ?? a.tournament_elo
       const pb = b.power_ranking ?? b.tournament_elo
@@ -140,6 +188,11 @@ export default function LadderPage() {
     }
     return b.tournament_elo - a.tournament_elo
   }) : []
+
+  // In season view, filter out players with 0 games
+  const displayPlayers = isSeasonView
+    ? sortedPlayers.filter(p => (p.season_games || 0) > 0)
+    : sortedPlayers
 
   const toggleExpand = async (id) => {
     if (expandedId === id) {
@@ -158,13 +211,26 @@ export default function LadderPage() {
   const handleArchive = async (id) => {
     try {
       await api.archivePlayer(id)
-      refetch()
+      // Reload
+      const seasonId = selectedSeason === 'active' && activeSeason ? activeSeason.id
+        : selectedSeason !== 'all' ? parseInt(selectedSeason) : null
+      setPlayers(await api.getPlayers(true, seasonId))
     } catch {}
+  }
+
+  const refetch = async () => {
+    const seasonId = selectedSeason === 'active' && activeSeason ? activeSeason.id
+      : selectedSeason !== 'all' ? parseInt(selectedSeason) : null
+    setPlayers(await api.getPlayers(true, seasonId))
   }
 
   if (loading) {
     return <div className="flex items-center justify-center h-64 text-surface-400">Loading...</div>
   }
+
+  const seasonLabel = selectedSeason === 'all' ? 'Global'
+    : selectedSeason === 'active' && activeSeason ? activeSeason.name
+    : seasons.find(s => s.id === parseInt(selectedSeason))?.name || 'Season'
 
   return (
     <div className="max-w-6xl mx-auto space-y-8 animate-fade-in">
@@ -187,7 +253,7 @@ export default function LadderPage() {
       </div>
 
       {/* KPIs */}
-      {overview && (
+      {overview && !isSeasonView && (
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <StatCard icon={Users} label="Active Players" value={overview.total_players} accent="accent" />
           <StatCard icon={Gamepad2} label="Total Matches" value={overview.total_matches} accent="blue" />
@@ -200,67 +266,140 @@ export default function LadderPage() {
         </div>
       )}
 
-      {/* Sort Toggle */}
-      {players && players.length > 0 && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-surface-400">Sort by:</span>
-          <button
-            onClick={() => setSortBy('elo')}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-              sortBy === 'elo' ? 'bg-accent/20 text-accent' : 'bg-surface-800 text-surface-400 hover:text-white'
-            }`}
-          >
-            Tournament Elo
-          </button>
-          <button
-            onClick={() => setSortBy('power')}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
-              sortBy === 'power' ? 'bg-accent/20 text-accent' : 'bg-surface-800 text-surface-400 hover:text-white'
-            }`}
-          >
-            <Zap size={12} /> Power Ranking
-          </button>
-          {sortBy === 'power' && (
-            <span className="text-[10px] text-surface-500 ml-1">Elo + Activity Bonus</span>
-          )}
+      {/* Season KPIs */}
+      {isSeasonView && displayPlayers.length > 0 && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <StatCard icon={Users} label="Season Players" value={displayPlayers.length} accent="accent" />
+          <StatCard icon={Gamepad2} label="Season Matches"
+            value={Math.round(displayPlayers.reduce((s, p) => s + (p.season_games || 0), 0) / 2)} accent="blue" />
+          <StatCard icon={TrendingUp} label="Most Improved"
+            value={displayPlayers[0]?.name || '-'}
+            sub={displayPlayers[0] ? `${displayPlayers[0].season_elo_diff > 0 ? '+' : ''}${Math.round(displayPlayers[0].season_elo_diff)} Elo` : ''}
+            accent="gold" />
+          <StatCard icon={Trophy} label="Best WR"
+            value={(() => {
+              const best = [...displayPlayers].filter(p => (p.season_games || 0) >= 3)
+                .sort((a, b) => (b.season_wins / b.season_games) - (a.season_wins / a.season_games))[0]
+              return best?.name || '-'
+            })()}
+            sub={(() => {
+              const best = [...displayPlayers].filter(p => (p.season_games || 0) >= 3)
+                .sort((a, b) => (b.season_wins / b.season_games) - (a.season_wins / a.season_games))[0]
+              return best ? `${Math.round(best.season_wins / best.season_games * 100)}%` : ''
+            })()}
+            accent="gold" />
         </div>
       )}
 
+      {/* Season Filter + Sort */}
+      <div className="flex items-center gap-3 flex-wrap">
+        {/* Season filter */}
+        <div className="flex items-center gap-2">
+          <Filter size={14} className="text-surface-400" />
+          <select
+            value={selectedSeason}
+            onChange={e => setSelectedSeason(e.target.value)}
+            className="bg-surface-800 border border-surface-700/50 rounded-lg px-3 py-1.5 text-sm text-white
+                       focus:outline-none focus:border-accent/50 transition-colors"
+          >
+            <option value="all">Global (All Time)</option>
+            {activeSeason && (
+              <option value="active">{activeSeason.name} (Active)</option>
+            )}
+            {seasons.filter(s => s.status === 'finished').map(s => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Sort toggle (only in global view) */}
+        {!isSeasonView && players && players.length > 0 && (
+          <div className="flex items-center gap-2 ml-auto">
+            <span className="text-xs text-surface-400">Sort by:</span>
+            <button
+              onClick={() => setSortBy('elo')}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                sortBy === 'elo' ? 'bg-accent/20 text-accent' : 'bg-surface-800 text-surface-400 hover:text-white'
+              }`}
+            >
+              Tournament Elo
+            </button>
+            <button
+              onClick={() => setSortBy('power')}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+                sortBy === 'power' ? 'bg-accent/20 text-accent' : 'bg-surface-800 text-surface-400 hover:text-white'
+              }`}
+            >
+              <Zap size={12} /> Power Ranking
+            </button>
+          </div>
+        )}
+
+        {isSeasonView && (
+          <span className="text-xs text-surface-500 ml-auto">
+            Sorted by season Elo change · Showing {displayPlayers.length} player(s) with games
+          </span>
+        )}
+      </div>
+
       {/* Table */}
-      {!players || players.length === 0 ? (
+      {!players || displayPlayers.length === 0 ? (
         <EmptyState
           icon={Users}
-          title="No players yet"
-          description="Add your first player to get started"
+          title={isSeasonView ? "No games this season" : "No players yet"}
+          description={isSeasonView ? "No matches have been played in this season yet" : "Add your first player to get started"}
           action={
-            <button onClick={() => setShowAdd(true)} className="btn-primary">
-              <UserPlus size={16} className="inline mr-1" /> Add Player
-            </button>
+            !isSeasonView && (
+              <button onClick={() => setShowAdd(true)} className="btn-primary">
+                <UserPlus size={16} className="inline mr-1" /> Add Player
+              </button>
+            )
           }
         />
       ) : (
         <div className="glass overflow-hidden">
           {/* Header row */}
-          <div className="grid grid-cols-[3rem_1fr_5rem_5rem_4.5rem_5rem_4rem_4rem] gap-2 px-5 py-3
-                          border-b border-surface-700/40 text-[11px] text-surface-400 font-semibold
-                          uppercase tracking-wider">
-            <span className="text-center">#</span>
-            <span>Player</span>
-            <span className="text-right">{sortBy === 'power' ? 'Power' : 'Elo'}</span>
-            <span className="text-right">{sortBy === 'power' ? 'Elo' : 'Power'}</span>
-            <span className="text-center">W/L</span>
-            <span className="text-center">WR</span>
-            <span className="text-center">MVP</span>
-            <span className="text-center">ACE</span>
-          </div>
+          {isSeasonView ? (
+            <div className="grid grid-cols-[3rem_1fr_5rem_5rem_4.5rem_5rem_4rem_4rem] gap-2 px-5 py-3
+                            border-b border-surface-700/40 text-[11px] text-surface-400 font-semibold
+                            uppercase tracking-wider">
+              <span className="text-center">#</span>
+              <span>Player</span>
+              <span className="text-right">Elo</span>
+              <span className="text-right">+/-</span>
+              <span className="text-center">W/L</span>
+              <span className="text-center">WR</span>
+              <span className="text-center">MVP</span>
+              <span className="text-center">ACE</span>
+            </div>
+          ) : (
+            <div className="grid grid-cols-[3rem_1fr_5rem_5rem_4.5rem_5rem_4rem_4rem] gap-2 px-5 py-3
+                            border-b border-surface-700/40 text-[11px] text-surface-400 font-semibold
+                            uppercase tracking-wider">
+              <span className="text-center">#</span>
+              <span>Player</span>
+              <span className="text-right">{sortBy === 'power' ? 'Power' : 'Elo'}</span>
+              <span className="text-right">{sortBy === 'power' ? 'Elo' : 'Power'}</span>
+              <span className="text-center">W/L</span>
+              <span className="text-center">WR</span>
+              <span className="text-center">MVP</span>
+              <span className="text-center">ACE</span>
+            </div>
+          )}
 
           {/* Player rows */}
-          {sortedPlayers.map((p, i) => {
-            const wr = p.games_played > 0 ? `${Math.round(p.wins / p.games_played * 100)}%` : '-'
+          {displayPlayers.map((p, i) => {
             const isExpanded = expandedId === p.id
             const stats = playerStats[p.id]
             const power = p.power_ranking ?? p.tournament_elo
-            // v3: no activity_bonus, power_ranking = tournament_elo
+
+            // Season or global stats
+            const wins = isSeasonView ? (p.season_wins || 0) : p.wins
+            const losses = isSeasonView ? (p.season_losses || 0) : p.losses
+            const games = isSeasonView ? (p.season_games || 0) : p.games_played
+            const mvps = isSeasonView ? (p.season_mvps || 0) : p.mvp_count
+            const aces = isSeasonView ? (p.season_aces || 0) : p.ace_count
+            const wr = games > 0 ? `${Math.round(wins / games * 100)}%` : '-'
 
             return (
               <div key={p.id} className="border-b border-surface-700/20 last:border-0">
@@ -299,35 +438,51 @@ export default function LadderPage() {
                                   <ChevronDown size={14} className="text-surface-500 shrink-0" />}
                   </div>
 
-                  {/* Elo columns */}
-                  <span className="text-right text-sm font-mono font-semibold text-white">
-                    {Math.round(p.tournament_elo)}
-                  </span>
-                  <span className="text-right text-sm font-mono text-surface-400">
-                    {Math.round(power)}
-                  </span>
+                  {/* Elo / Season columns */}
+                  {isSeasonView ? (
+                    <>
+                      <span className="text-right text-sm font-mono font-semibold text-white">
+                        {Math.round(p.tournament_elo)}
+                      </span>
+                      <span className={`text-right text-sm font-mono font-semibold ${
+                        (p.season_elo_diff || 0) > 0 ? 'text-emerald-400' :
+                        (p.season_elo_diff || 0) < 0 ? 'text-red-400' : 'text-surface-400'
+                      }`}>
+                        {(p.season_elo_diff || 0) > 0 ? '+' : ''}{Math.round(p.season_elo_diff || 0)}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-right text-sm font-mono font-semibold text-white">
+                        {Math.round(p.tournament_elo)}
+                      </span>
+                      <span className="text-right text-sm font-mono text-surface-400">
+                        {Math.round(power)}
+                      </span>
+                    </>
+                  )}
 
                   {/* W/L */}
                   <span className="text-center text-xs font-mono text-surface-300">
-                    {p.wins}/{p.losses}
+                    {wins}/{losses}
                   </span>
 
                   {/* Win Rate */}
                   <span className={`text-center text-sm font-semibold
-                    ${p.games_played === 0 ? 'text-surface-500' :
-                      p.wins / p.games_played >= 0.6 ? 'text-emerald-400' :
-                      p.wins / p.games_played <= 0.4 ? 'text-red-400' : 'text-surface-200'}`}>
+                    ${games === 0 ? 'text-surface-500' :
+                      wins / games >= 0.6 ? 'text-emerald-400' :
+                      wins / games <= 0.4 ? 'text-red-400' : 'text-surface-200'}`}>
                     {wr}
                   </span>
 
                   {/* MVP */}
                   <div className="flex justify-center">
-                    {p.mvp_count > 0 ? <Badge variant="mvp" count={p.mvp_count} /> : <span className="text-surface-600 text-xs">-</span>}
+                    {mvps > 0 ? <Badge variant="mvp" count={mvps} /> : <span className="text-surface-600 text-xs">-</span>}
                   </div>
 
                   {/* ACE */}
                   <div className="flex justify-center">
-                    {p.ace_count > 0 ? <Badge variant="ace" count={p.ace_count} /> : <span className="text-surface-600 text-xs">-</span>}
+                    {aces > 0 ? <Badge variant="ace" count={aces} /> : <span className="text-surface-600 text-xs">-</span>}
                   </div>
                 </div>
 
@@ -347,10 +502,23 @@ export default function LadderPage() {
                            (stats.player.loss_streak || 0) > 0 ? `❄️ ${stats.player.loss_streak}L` : '—'}
                         </p>
                       </div>
-                      <div className="bg-surface-800/50 rounded-lg px-3 py-2">
-                        <p className="text-[10px] text-surface-500 uppercase tracking-wider">Power Ranking</p>
-                        <p className="text-lg font-mono font-bold text-accent">{Math.round(stats.power_ranking)}</p>
-                      </div>
+                      {isSeasonView && (
+                        <div className="bg-surface-800/50 rounded-lg px-3 py-2">
+                          <p className="text-[10px] text-surface-500 uppercase tracking-wider">Season Change</p>
+                          <p className={`text-lg font-mono font-bold ${
+                            (p.season_elo_diff || 0) > 0 ? 'text-emerald-400' :
+                            (p.season_elo_diff || 0) < 0 ? 'text-red-400' : 'text-surface-300'
+                          }`}>
+                            {(p.season_elo_diff || 0) > 0 ? '+' : ''}{Math.round(p.season_elo_diff || 0)}
+                          </p>
+                        </div>
+                      )}
+                      {!isSeasonView && (
+                        <div className="bg-surface-800/50 rounded-lg px-3 py-2">
+                          <p className="text-[10px] text-surface-500 uppercase tracking-wider">Power Ranking</p>
+                          <p className="text-lg font-mono font-bold text-accent">{Math.round(stats.power_ranking)}</p>
+                        </div>
+                      )}
                       <div className="bg-surface-800/50 rounded-lg px-3 py-2">
                         <p className="text-[10px] text-surface-500 uppercase tracking-wider flex items-center gap-1">
                           <Clock size={10} /> Last Played
