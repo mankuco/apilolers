@@ -20,12 +20,15 @@ export default function AddPlayerModal({ open, onClose, onAdded }) {
   const reset = () => {
     setName(''); setTag(''); setTier('GOLD'); setDiv('IV')
     setUseAvg(false); setLookupStatus(null); setLookupData(null)
-    setError(null)
+    setLookupMsg(''); setError(null)
   }
+
+  const [lookupMsg, setLookupMsg] = useState('')
 
   const handleLookup = async () => {
     if (!tag) return
     setLookupStatus('loading')
+    setLookupMsg('')
     try {
       const res = await api.riotLookup(tag)
       if (res.found) {
@@ -37,9 +40,11 @@ export default function AddPlayerModal({ open, onClose, onAdded }) {
       } else {
         setLookupStatus('notfound')
         setLookupData(null)
+        setLookupMsg(res.message || 'Could not reach Riot API')
       }
-    } catch {
+    } catch (e) {
       setLookupStatus('notfound')
+      setLookupMsg(e.message || 'Request failed')
     }
   }
 
@@ -123,9 +128,9 @@ export default function AddPlayerModal({ open, onClose, onAdded }) {
             </div>
           )}
           {lookupStatus === 'notfound' && (
-            <div className="mt-2 flex items-center gap-2 text-amber-400 text-sm">
-              <AlertCircle size={16} />
-              <span>Riot API unavailable — set rank manually below</span>
+            <div className="mt-2 flex items-start gap-2 text-amber-400 text-sm">
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+              <span>{lookupMsg || 'Riot API unavailable'} — set rank manually below</span>
             </div>
           )}
         </div>

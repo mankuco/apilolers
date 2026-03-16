@@ -6,6 +6,7 @@ import VersusPage from './pages/VersusPage'
 import HistoryPage from './pages/HistoryPage'
 import ChampionsPage from './pages/ChampionsPage'
 import DuelPage from './pages/DuelPage'
+import SeasonsPage from './pages/SeasonsPage'
 import TournamentPage from './pages/TournamentPage'
 
 export default function App() {
@@ -19,6 +20,7 @@ export default function App() {
         <Route path="history" element={<HistoryPage />} />
         <Route path="champions" element={<ChampionsPage />} />
         <Route path="duels" element={<DuelPage />} />
+        <Route path="seasons" element={<SeasonsPage />} />
         <Route path="tournament" element={<TournamentPage />} />
       </Route>
     </Routes>

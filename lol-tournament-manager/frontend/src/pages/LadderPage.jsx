@@ -9,30 +9,39 @@ import EmptyState from '../components/EmptyState'
 import { useApi } from '../hooks/useApi'
 import * as api from '../api/client'
 
-/* ── Activity dot (based on activity_bonus from backend) ── */
-function ActivityIndicator({ bonus, lastPlayed }) {
+/* ── Activity dot (based on ausencias_consecutivas / is_inactive) ── */
+function ActivityIndicator({ player }) {
+  const ausencias = player.ausencias_consecutivas || 0
+  const inactive = player.is_inactive
+  const lastPlayed = player.last_played
   let color, title
   if (!lastPlayed) {
     color = 'text-surface-600'
     title = 'Never played'
-  } else if (bonus >= 2) {
-    color = 'text-emerald-400'
-    title = 'Active (last 14 days)'
-  } else if (bonus >= 1) {
-    color = 'text-yellow-400'
-    title = 'Recent (last 30 days)'
-  } else if (bonus === 0) {
-    color = 'text-surface-500'
-    title = 'Inactive (30-45 days)'
-  } else {
+  } else if (inactive) {
     color = 'text-red-400'
-    title = 'Inactive (>45 days)'
+    title = `Inactive (${ausencias} jornadas missed)`
+  } else if (ausencias > 0) {
+    color = 'text-yellow-400'
+    title = `${ausencias} jornada(s) missed`
+  } else {
+    color = 'text-emerald-400'
+    title = 'Active'
   }
   return (
     <span className={`${color} text-[10px] font-bold`} title={title}>
       {!lastPlayed ? '○' : '●'}
     </span>
   )
+}
+
+/* ── Streak badge ── */
+function StreakBadge({ player }) {
+  const ws = player.win_streak || 0
+  const ls = player.loss_streak || 0
+  if (ws >= 3) return <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded-full ml-1" title={`${ws} win streak`}>🔥{ws}W</span>
+  if (ls >= 3) return <span className="text-[10px] bg-red-500/20 text-red-400 px-1.5 py-0.5 rounded-full ml-1" title={`${ls} loss streak`}>❄️{ls}L</span>
+  return null
 }
 
 /* ── Mini sparkline-style Elo chart (SVG) ── */
@@ -251,7 +260,7 @@ export default function LadderPage() {
             const isExpanded = expandedId === p.id
             const stats = playerStats[p.id]
             const power = p.power_ranking ?? p.tournament_elo
-            const actBonus = p.activity_bonus ?? 0
+            // v3: no activity_bonus, power_ranking = tournament_elo
 
             return (
               <div key={p.id} className="border-b border-surface-700/20 last:border-0">
@@ -274,7 +283,8 @@ export default function LadderPage() {
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5">
                         <p className="text-sm font-semibold text-white truncate">{p.name}</p>
-                        <ActivityIndicator bonus={actBonus} lastPlayed={p.last_played} />
+                        <ActivityIndicator player={p} />
+                        <StreakBadge player={p} />
                       </div>
                       <p className="text-[11px] text-surface-500 truncate">
                         {p.lol_name_tag}
@@ -289,30 +299,13 @@ export default function LadderPage() {
                                   <ChevronDown size={14} className="text-surface-500 shrink-0" />}
                   </div>
 
-                  {/* Primary sort column */}
-                  {sortBy === 'power' ? (
-                    <>
-                      <span className={`text-right text-sm font-mono font-semibold ${
-                        actBonus > 0 ? 'text-emerald-400' : actBonus < 0 ? 'text-red-400' : 'text-white'
-                      }`}>
-                        {Math.round(power)}
-                      </span>
-                      <span className="text-right text-sm font-mono text-surface-400">
-                        {Math.round(p.tournament_elo)}
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-right text-sm font-mono font-semibold text-white">
-                        {Math.round(p.tournament_elo)}
-                      </span>
-                      <span className={`text-right text-sm font-mono ${
-                        actBonus > 0 ? 'text-emerald-400' : actBonus < 0 ? 'text-red-400' : 'text-surface-400'
-                      }`}>
-                        {Math.round(power)}
-                      </span>
-                    </>
-                  )}
+                  {/* Elo columns */}
+                  <span className="text-right text-sm font-mono font-semibold text-white">
+                    {Math.round(p.tournament_elo)}
+                  </span>
+                  <span className="text-right text-sm font-mono text-surface-400">
+                    {Math.round(power)}
+                  </span>
 
                   {/* W/L */}
                   <span className="text-center text-xs font-mono text-surface-300">
@@ -348,12 +341,10 @@ export default function LadderPage() {
                         <p className="text-lg font-mono font-bold text-white">{Math.round(stats.player.tournament_elo)}</p>
                       </div>
                       <div className="bg-surface-800/50 rounded-lg px-3 py-2">
-                        <p className="text-[10px] text-surface-500 uppercase tracking-wider">Activity Bonus</p>
-                        <p className={`text-lg font-mono font-bold ${
-                          stats.activity_bonus > 0 ? 'text-emerald-400' :
-                          stats.activity_bonus < 0 ? 'text-red-400' : 'text-surface-300'
-                        }`}>
-                          {stats.activity_bonus > 0 ? '+' : ''}{stats.activity_bonus}
+                        <p className="text-[10px] text-surface-500 uppercase tracking-wider">Streak</p>
+                        <p className="text-lg font-mono font-bold text-surface-300">
+                          {(stats.player.win_streak || 0) > 0 ? `🔥 ${stats.player.win_streak}W` :
+                           (stats.player.loss_streak || 0) > 0 ? `❄️ ${stats.player.loss_streak}L` : '—'}
                         </p>
                       </div>
                       <div className="bg-surface-800/50 rounded-lg px-3 py-2">

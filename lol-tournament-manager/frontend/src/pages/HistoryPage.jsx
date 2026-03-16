@@ -23,11 +23,14 @@ function EloBreakdown({ data }) {
           P:{data.performance_mod > 0 ? '+' : ''}{data.performance_mod?.toFixed(1)}
         </span>
       )}
-      {data.activity_bonus !== 0 && (
-        <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${
-          data.activity_bonus > 0 ? 'bg-blue-500/10 text-blue-400' : 'bg-red-500/10 text-red-400'
-        }`}>
-          A:{data.activity_bonus > 0 ? '+' : ''}{data.activity_bonus?.toFixed(0)}
+      {data.k_used && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-700/50 text-surface-400 font-mono">
+          K:{data.k_used}
+        </span>
+      )}
+      {data.streak_multiplier && data.streak_multiplier !== 1 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/10 text-orange-400 font-mono">
+          🔥×{data.streak_multiplier}
         </span>
       )}
       {data.award_bonus !== 0 && (

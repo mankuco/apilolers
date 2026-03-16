@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  tournament:
+    build: .
+    container_name: lol-tournament
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - tournament-data:/app/data
+    environment:
+      - DB_PATH=/app/data/tournament.db
+      # Optional: set your Riot API key here
+      - RIOT_API_KEY=RGAPI-c6fd7d5b-e3fa-4423-88e4-3d72b79a7440
+
+volumes:
+  tournament-data:
+    driver: local

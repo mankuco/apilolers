@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { Trophy, Swords, ScrollText, Gamepad2, GitCompareArrows, Settings, Target } from 'lucide-react'
+import { Trophy, Swords, ScrollText, Gamepad2, GitCompareArrows, Settings, Target, Calendar } from 'lucide-react'
 
 const NAV = [
   { to: '/ladder',     icon: Trophy,           label: 'Ladder' },
@@ -8,6 +8,7 @@ const NAV = [
   { to: '/history',    icon: ScrollText,       label: 'History' },
   { to: '/champions',  icon: Gamepad2,         label: 'Champions' },
   { to: '/duels',      icon: Target,           label: '1v1 Arena' },
+  { to: '/seasons',    icon: Calendar,         label: 'Seasons' },
   { to: '/tournament', icon: Settings,         label: 'Tournament' },
 ]
 
@@ -49,7 +50,7 @@ export default function Sidebar() {
 
       {/* Footer */}
       <div className="hidden lg:block px-5 py-4 border-t border-surface-700/40">
-        <p className="text-[10px] text-surface-500 uppercase tracking-widest">Internal League v2.0</p>
+        <p className="text-[10px] text-surface-500 uppercase tracking-widest">Internal League v3.0</p>
       </div>
     </aside>
   )

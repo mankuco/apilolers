@@ -28,10 +28,30 @@ function StatusBadge({ ok, label }) {
   )
 }
 
+const TOURNAMENT_PASSWORD = 'apilolers2026'
+
 export default function TournamentPage() {
-  const { data: config, loading: configLoading, refetch: refetchConfig } = useApi(() => api.getTournamentConfig())
-  const { data: keyStatus, refetch: refetchKey } = useApi(() => api.getRiotKeyStatus())
-  const { data: formula } = useApi(() => api.getEloFormula())
+  // Password gate
+  const [authenticated, setAuthenticated] = useState(() => {
+    try { return sessionStorage.getItem('tournament_auth') === 'true' } catch { return false }
+  })
+  const [passwordInput, setPasswordInput] = useState('')
+  const [passwordError, setPasswordError] = useState(false)
+
+  const handlePasswordSubmit = (e) => {
+    e.preventDefault()
+    if (passwordInput === TOURNAMENT_PASSWORD) {
+      setAuthenticated(true)
+      try { sessionStorage.setItem('tournament_auth', 'true') } catch {}
+    } else {
+      setPasswordError(true)
+      setTimeout(() => setPasswordError(false), 2000)
+    }
+  }
+
+  const { data: config, loading: configLoading, refetch: refetchConfig } = useApi(() => authenticated ? api.getTournamentConfig() : Promise.resolve(null))
+  const { data: keyStatus, refetch: refetchKey } = useApi(() => authenticated ? api.getRiotKeyStatus() : Promise.resolve(null))
+  const { data: formula } = useApi(() => authenticated ? api.getEloFormula() : Promise.resolve(null))
 
   // Mode tab
   const [activeTab, setActiveTab] = useState('manual') // 'manual' | 'tournament'
@@ -145,6 +165,41 @@ export default function TournamentPage() {
 
   const REGIONS = ['BR', 'EUNE', 'EUW', 'JP', 'KR', 'LAN', 'LAS', 'NA', 'OCE', 'RU', 'TR']
 
+  if (!authenticated) {
+    return (
+      <div className="max-w-sm mx-auto mt-24 animate-fade-in">
+        <div className="glass p-8 text-center space-y-6">
+          <div className="w-16 h-16 rounded-full bg-accent/20 flex items-center justify-center mx-auto">
+            <Shield size={32} className="text-accent" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-white">Tournament Admin</h1>
+            <p className="text-sm text-surface-400 mt-1">Enter the password to access settings</p>
+          </div>
+          <form onSubmit={handlePasswordSubmit} className="space-y-3">
+            <input
+              type="password"
+              value={passwordInput}
+              onChange={e => { setPasswordInput(e.target.value); setPasswordError(false) }}
+              placeholder="Password"
+              autoFocus
+              className={`w-full bg-surface-800 border rounded-xl px-4 py-3 text-sm text-white text-center
+                         font-mono placeholder:text-surface-600 focus:outline-none transition-colors
+                         ${passwordError ? 'border-red-500/60 bg-red-500/5' : 'border-surface-700/50 focus:border-accent/50'}`}
+            />
+            {passwordError && (
+              <p className="text-xs text-red-400">Wrong password</p>
+            )}
+            <button type="submit" className="btn-primary w-full py-2.5">
+              <Key size={16} className="inline mr-2" />
+              Unlock
+            </button>
+          </form>
+        </div>
+      </div>
+    )
+  }
+
   if (configLoading) {
     return <div className="flex items-center justify-center h-64 text-surface-400">Loading...</div>
   }
@@ -154,7 +209,7 @@ export default function TournamentPage() {
       <div>
         <h1 className="text-2xl font-bold text-white">Configuration & Info</h1>
         <p className="text-sm text-surface-400 mt-1">
-          Manage your league mode, API key, and view the Elo v2 formula
+          Manage your league mode, API key, and view the Elo v3 formula
         </p>
       </div>
 
@@ -641,21 +696,21 @@ export default function TournamentPage() {
         </>
       )}
 
-      {/* ── ELO V2 FORMULA (always visible) ── */}
+      {/* ── ELO V3 FORMULA (always visible) ── */}
       {formula && (
         <div className="glass p-6 space-y-4">
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Elo v2 Formula</h2>
+          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Elo v3 Formula</h2>
           <div className="bg-surface-800/50 rounded-xl p-4 font-mono text-sm text-surface-200">
             <p className="text-accent">{formula.formula}</p>
           </div>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
             <div className="bg-surface-800/50 rounded-lg p-3">
-              <p className="text-surface-500 uppercase tracking-widest text-[10px]">K-Factor</p>
-              <p className="text-white font-mono text-lg">{formula.k_factor}</p>
+              <p className="text-surface-500 uppercase tracking-widest text-[10px]">Elo Range</p>
+              <p className="text-white font-mono text-lg">{formula.elo_range?.[0]} – {formula.elo_range?.[1]}</p>
             </div>
             <div className="bg-surface-800/50 rounded-lg p-3">
-              <p className="text-surface-500 uppercase tracking-widest text-[10px]">Clamp</p>
-              <p className="text-white font-mono text-lg">{formula.clamp[0]} / +{formula.clamp[1]}</p>
+              <p className="text-surface-500 uppercase tracking-widest text-[10px]">Calibration</p>
+              <p className="text-white font-mono text-lg">{formula.calibration_games} games</p>
             </div>
             <div className="bg-surface-800/50 rounded-lg p-3">
               <p className="text-surface-500 uppercase tracking-widest text-[10px]">MVP Bonus</p>
@@ -667,33 +722,54 @@ export default function TournamentPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {/* K-Factor */}
             <div>
-              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2">Performance Weights</h3>
+              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2">Dynamic K-Factor</h3>
               <div className="space-y-1.5">
-                {Object.entries(formula.performance_weights).map(([key, val]) => (
-                  <div key={key} className="flex items-center gap-2">
-                    <div className="flex-1 h-2 bg-surface-700 rounded-full overflow-hidden">
-                      <div className="h-full bg-accent/60 rounded-full" style={{ width: `${val * 100}%` }} />
-                    </div>
-                    <span className="text-xs text-surface-300 w-28">{key.replace(/_/g, ' ')}</span>
-                    <span className="text-xs font-mono text-surface-400 w-10 text-right">{(val * 100).toFixed(0)}%</span>
+                {formula.k_factor && Object.entries(formula.k_factor).map(([key, val]) => (
+                  <div key={key} className="flex items-center justify-between py-1 border-b border-surface-700/30 last:border-0">
+                    <span className="text-xs text-surface-300">{key.replace(/_/g, ' ')}</span>
+                    <span className="text-xs font-mono font-semibold text-white">{val}</span>
                   </div>
                 ))}
               </div>
-              <p className="text-[10px] text-surface-500 mt-2 italic">
-                Performance data only available with Tournament API mode
-              </p>
             </div>
+
+            {/* Performance Roles */}
             <div>
-              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2">Activity Bonus</h3>
+              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2">Role-based Performance</h3>
               <div className="space-y-1.5">
-                {Object.entries(formula.activity_bonus).map(([key, val]) => (
+                {formula.performance_roles && Object.entries(formula.performance_roles).map(([role, weights]) => (
+                  <div key={role} className="py-1 border-b border-surface-700/30 last:border-0">
+                    <span className="text-xs font-semibold text-accent">{role}</span>
+                    <p className="text-[10px] text-surface-400 font-mono mt-0.5">{weights}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[10px] text-surface-500 mt-2">{formula.contribution_factor}</p>
+            </div>
+
+            {/* Streaks & Decay */}
+            <div>
+              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2">Streaks</h3>
+              <div className="space-y-1.5">
+                {formula.streaks && Object.entries(formula.streaks).map(([key, val]) => (
                   <div key={key} className="flex items-center justify-between py-1 border-b border-surface-700/30 last:border-0">
                     <span className="text-xs text-surface-300">{key.replace(/_/g, ' ')}</span>
-                    <span className={`text-xs font-mono font-semibold ${
-                      val.startsWith('+') ? 'text-emerald-400' : val === '0' ? 'text-surface-400' : 'text-red-400'
-                    }`}>{val}</span>
+                    <span className="text-xs font-mono font-semibold text-orange-400">{val}</span>
+                  </div>
+                ))}
+              </div>
+
+              <h3 className="text-xs text-surface-400 font-semibold uppercase tracking-wider mb-2 mt-4">Inactivity Decay</h3>
+              <div className="space-y-1.5">
+                {formula.decay && Object.entries(formula.decay).map(([key, val]) => (
+                  <div key={key} className="flex items-center justify-between py-1 border-b border-surface-700/30 last:border-0">
+                    <span className="text-xs text-surface-300">{key.replace(/_/g, ' ')}</span>
+                    <span className={`text-xs font-mono font-semibold ${val > 0 ? 'text-red-400' : 'text-surface-400'}`}>
+                      {val > 0 ? `-${val}` : '0'}
+                    </span>
                   </div>
                 ))}
               </div>

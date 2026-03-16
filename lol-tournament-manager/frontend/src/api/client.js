@@ -114,3 +114,35 @@ export const getDuelStats = () => request('/duels/stats')
 
 // ── Elo Formula ──────────────────────────────────────────
 export const getEloFormula = () => request('/elo/formula')
+
+// ── Seasons & Jornadas ──────────────────────────────────
+export const getSeasons = () => request('/seasons')
+
+export const getActiveSeason = () => request('/seasons/active')
+
+export const createSeason = (name, startDate = null, endDate = null) =>
+  request('/seasons', { method: 'POST', body: JSON.stringify({ name, start_date: startDate, end_date: endDate }) })
+
+export const closeSeason = (seasonId) =>
+  request(`/seasons/${seasonId}/close`, { method: 'POST' })
+
+export const createJornada = (seasonId, name = '', startDate = null, endDate = null) =>
+  request('/jornadas', { method: 'POST', body: JSON.stringify({ season_id: seasonId, name, start_date: startDate, end_date: endDate }) })
+
+export const getJornada = (jornadaId) => request(`/jornadas/${jornadaId}`)
+
+export const linkMatchToJornada = (matchId, jornadaId) =>
+  request('/jornadas/link-match', {
+    method: 'POST',
+    body: JSON.stringify({ match_id: matchId, jornada_id: jornadaId }),
+  })
+
+export const closeJornada = (jornadaId) =>
+  request(`/jornadas/${jornadaId}/close`, { method: 'POST' })
+
+// ── Season Awards ───────────────────────────────────────
+export const computeSeasonAwards = (seasonId) =>
+  request(`/seasons/${seasonId}/compute-awards`, { method: 'POST' })
+
+export const getSeasonAwards = (seasonId) =>
+  request(`/seasons/${seasonId}/awards`)

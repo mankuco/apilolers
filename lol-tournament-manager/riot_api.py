@@ -82,15 +82,19 @@ def _get_region_for_tag(tag: str) -> tuple[str, str]:
         return "europe", "euw1"
 
 
-def fetch_player_rank(name_tag: str) -> Optional[dict]:
+def fetch_player_rank(name_tag: str) -> dict | None:
     """
     Look up a player's Solo/Duo rank via the Riot API.
 
     Returns dict with keys: tier, division, lp, elo   or None on failure.
+    On failure, returns dict with "error" key describing the problem.
     """
+    import logging
+    log = logging.getLogger(__name__)
+
     api_key = get_api_key()
     if not api_key:
-        return None
+        return {"error": "No Riot API key configured. Set it in the Tournament tab."}
 
     game_name, tag_line = parse_name_tag(name_tag)
     account_region, platform = _get_region_for_tag(tag_line)
@@ -104,7 +108,14 @@ def fetch_player_rank(name_tag: str) -> Optional[dict]:
             f"https://{account_region}.api.riotgames.com"
             f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
         )
+        log.info("Riot lookup step 1: %s", acct_url)
         r = httpx.get(acct_url, headers=headers, timeout=timeout)
+        if r.status_code == 403:
+            return {"error": "API key is invalid or expired (403 Forbidden)."}
+        if r.status_code == 404:
+            return {"error": f"Player '{game_name}#{tag_line}' not found on Riot servers."}
+        if r.status_code == 429:
+            return {"error": "Riot API rate limit exceeded. Try again in a minute."}
         r.raise_for_status()
         puuid = r.json()["puuid"]
 
@@ -113,7 +124,12 @@ def fetch_player_rank(name_tag: str) -> Optional[dict]:
             f"https://{platform}.api.riotgames.com"
             f"/lol/summoner/v4/summoners/by-puuid/{puuid}"
         )
+        log.info("Riot lookup step 2: %s", summ_url)
         r2 = httpx.get(summ_url, headers=headers, timeout=timeout)
+        if r2.status_code == 403:
+            return {"error": "API key lacks summoner-v4 access (403)."}
+        if r2.status_code == 404:
+            return {"error": f"Summoner not found on platform '{platform}'. Wrong region?"}
         r2.raise_for_status()
         summoner_id = r2.json()["id"]
 
@@ -122,6 +138,7 @@ def fetch_player_rank(name_tag: str) -> Optional[dict]:
             f"https://{platform}.api.riotgames.com"
             f"/lol/league/v4/entries/by-summoner/{summoner_id}"
         )
+        log.info("Riot lookup step 3: %s", league_url)
         r3 = httpx.get(league_url, headers=headers, timeout=timeout)
         r3.raise_for_status()
 
@@ -140,8 +157,13 @@ def fetch_player_rank(name_tag: str) -> Optional[dict]:
         # Player has no Solo/Duo rank → return unranked placeholder
         return {"tier": "UNRANKED", "division": "", "lp": 0, "elo": 1000.0}
 
-    except Exception:
-        return None
+    except httpx.ConnectError:
+        return {"error": "Cannot reach Riot API servers. Check your network connection."}
+    except httpx.TimeoutException:
+        return {"error": "Riot API request timed out. Try again later."}
+    except Exception as exc:
+        log.exception("Riot lookup failed")
+        return {"error": f"Unexpected error: {str(exc)}"}
 
 
 # ── Champion list (static subset for dropdowns) ─────────────────────────────

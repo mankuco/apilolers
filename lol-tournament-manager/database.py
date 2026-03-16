@@ -14,8 +14,9 @@ from typing import Optional
 
 
 # Store DB in a writable location; fall back to script dir if needed
+# Docker sets DB_PATH env var to /app/data/tournament.db
 _DEFAULT_DIR = os.environ.get("TOURNAMENT_DB_DIR", os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_DEFAULT_DIR, "tournament.db")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(_DEFAULT_DIR, "tournament.db"))
 
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -156,6 +157,41 @@ def init_db(db_path: str = DB_PATH):
         win_streak      INTEGER NOT NULL DEFAULT 0,
         best_streak     INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS seasons (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        name            TEXT NOT NULL,
+        started_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        ended_at        TEXT,
+        status          TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active', 'finished'))
+    );
+
+    CREATE TABLE IF NOT EXISTS jornadas (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        season_id       INTEGER NOT NULL REFERENCES seasons(id),
+        name            TEXT NOT NULL DEFAULT '',
+        played_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        closed          INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS jornada_matches (
+        jornada_id      INTEGER NOT NULL REFERENCES jornadas(id),
+        match_id        INTEGER NOT NULL REFERENCES matches(id),
+        PRIMARY KEY(jornada_id, match_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS season_awards (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        season_id       INTEGER NOT NULL REFERENCES seasons(id),
+        award_type      TEXT NOT NULL,
+        winner_player_id INTEGER REFERENCES players(id),
+        player_a_id     INTEGER REFERENCES players(id),
+        player_b_id     INTEGER REFERENCES players(id),
+        value           REAL,
+        extra           TEXT NOT NULL DEFAULT '{}',
+        computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     """)
 
     conn.commit()
@@ -191,6 +227,40 @@ def _migrate(conn: sqlite3.Connection):
     # Add archived column to matches
     if "archived" not in cols:
         cur.execute("ALTER TABLE matches ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+
+    # New v3 columns on players for streaks and inactivity
+    if "win_streak" not in {row[1] for row in cur.execute("PRAGMA table_info(players)").fetchall()}:
+        cur.execute("ALTER TABLE players ADD COLUMN win_streak INTEGER NOT NULL DEFAULT 0")
+    cols_p2 = {row[1] for row in cur.execute("PRAGMA table_info(players)").fetchall()}
+    if "loss_streak" not in cols_p2:
+        cur.execute("ALTER TABLE players ADD COLUMN loss_streak INTEGER NOT NULL DEFAULT 0")
+    if "best_win_streak" not in cols_p2:
+        cur.execute("ALTER TABLE players ADD COLUMN best_win_streak INTEGER NOT NULL DEFAULT 0")
+    if "ausencias_consecutivas" not in cols_p2:
+        cur.execute("ALTER TABLE players ADD COLUMN ausencias_consecutivas INTEGER NOT NULL DEFAULT 0")
+    if "is_inactive" not in cols_p2:
+        cur.execute("ALTER TABLE players ADD COLUMN is_inactive INTEGER NOT NULL DEFAULT 0")
+    if "elo_inicio_temporada" not in cols_p2:
+        cur.execute("ALTER TABLE players ADD COLUMN elo_inicio_temporada REAL")
+
+    # Add jornada_id to matches if missing
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(matches)").fetchall()}
+    if "jornada_id" not in cols:
+        cur.execute("ALTER TABLE matches ADD COLUMN jornada_id INTEGER REFERENCES jornadas(id)")
+
+    # Add start_date/end_date to jornadas for date-range auto-linking
+    j_cols = {row[1] for row in cur.execute("PRAGMA table_info(jornadas)").fetchall()}
+    if "start_date" not in j_cols:
+        cur.execute("ALTER TABLE jornadas ADD COLUMN start_date TEXT")
+    if "end_date" not in j_cols:
+        cur.execute("ALTER TABLE jornadas ADD COLUMN end_date TEXT")
+
+    # Add start_date/end_date to seasons
+    s_cols = {row[1] for row in cur.execute("PRAGMA table_info(seasons)").fetchall()}
+    if "start_date" not in s_cols:
+        cur.execute("ALTER TABLE seasons ADD COLUMN start_date TEXT")
+    if "end_date" not in s_cols:
+        cur.execute("ALTER TABLE seasons ADD COLUMN end_date TEXT")
 
     # Backfill last_played for players who have matches but null last_played
     cur.execute("""
@@ -395,6 +465,23 @@ def save_match(team_blue: list[int], team_red: list[int],
         tournament_code, riot_match_id, duration_seconds, status,
     ))
     match_id = cur.lastrowid
+
+    # Auto-link to jornada if match date falls within an open jornada's date range
+    cur.execute("""
+        SELECT id FROM jornadas
+        WHERE closed = 0
+          AND start_date IS NOT NULL AND end_date IS NOT NULL
+          AND date(?) >= date(start_date) AND date(?) <= date(end_date)
+        ORDER BY id DESC LIMIT 1
+    """, (ts, ts))
+    jornada_row = cur.fetchone()
+    if jornada_row:
+        jid = jornada_row["id"]
+        cur.execute("INSERT OR IGNORE INTO jornada_matches (jornada_id, match_id) VALUES (?, ?)",
+                    (jid, match_id))
+        cur.execute("UPDATE matches SET jornada_id = ? WHERE id = ? AND (jornada_id IS NULL OR jornada_id = 0)",
+                    (jid, match_id))
+
     conn.commit()
     conn.close()
     return match_id
@@ -740,11 +827,12 @@ def reset_all_for_recalc(starting_elos: dict[int, float], db_path: str = DB_PATH
     """
     conn = get_connection(db_path)
 
-    # Reset player stats
+    # Reset player stats (including v3 streaks)
     conn.execute("""
         UPDATE players SET
             games_played = 0, wins = 0, losses = 0,
-            mvp_count = 0, ace_count = 0, last_played = NULL
+            mvp_count = 0, ace_count = 0, last_played = NULL,
+            win_streak = 0, loss_streak = 0
     """)
 
     # Reset each player's Elo to their starting value
@@ -783,6 +871,264 @@ def update_match_elo_changes(match_id: int, elo_changes: dict, db_path: str = DB
     )
     conn.commit()
     conn.close()
+
+
+# ── 1v1 Duel System ───────────────────────────────────────────────────────
+
+# ── Season / Jornada / Awards CRUD ──────────────────────────────────────────
+
+def create_season(name: str, start_date: Optional[str] = None, end_date: Optional[str] = None,
+                   db_path: str = DB_PATH) -> int:
+    """Create a new season. Only one can be active at a time."""
+    conn = get_connection(db_path)
+    # Close any active season first
+    conn.execute("UPDATE seasons SET status = 'finished', ended_at = datetime('now') WHERE status = 'active'")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO seasons (name, start_date, end_date) VALUES (?, ?, ?)",
+                (name, start_date, end_date))
+    sid = cur.lastrowid
+    # Snapshot every active player's current Elo as elo_inicio_temporada
+    conn.execute("UPDATE players SET elo_inicio_temporada = tournament_elo, ausencias_consecutivas = 0 WHERE active = 1")
+    conn.commit()
+    conn.close()
+    return sid
+
+
+def get_active_season(db_path: str = DB_PATH) -> Optional[dict]:
+    conn = get_connection(db_path)
+    row = conn.execute("SELECT * FROM seasons WHERE status = 'active' ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_all_seasons(db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute("SELECT * FROM seasons ORDER BY id DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_season(season_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    conn = get_connection(db_path)
+    row = conn.execute("SELECT * FROM seasons WHERE id = ?", (season_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def close_season(season_id: int, db_path: str = DB_PATH):
+    conn = get_connection(db_path)
+    conn.execute("UPDATE seasons SET status = 'finished', ended_at = datetime('now') WHERE id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def create_jornada(season_id: int, name: str = "", start_date: Optional[str] = None,
+                    end_date: Optional[str] = None, db_path: str = DB_PATH) -> int:
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO jornadas (season_id, name, start_date, end_date) VALUES (?, ?, ?, ?)",
+                (season_id, name, start_date, end_date))
+    jid = cur.lastrowid
+
+    # Auto-link matches whose timestamp falls within [start_date, end_date]
+    if start_date and end_date:
+        cur.execute("""
+            INSERT OR IGNORE INTO jornada_matches (jornada_id, match_id)
+            SELECT ?, id FROM matches
+            WHERE date(timestamp) >= date(?) AND date(timestamp) <= date(?)
+              AND archived = 0
+        """, (jid, start_date, end_date))
+        # Also set jornada_id on those matches
+        cur.execute("""
+            UPDATE matches SET jornada_id = ?
+            WHERE date(timestamp) >= date(?) AND date(timestamp) <= date(?)
+              AND archived = 0 AND (jornada_id IS NULL OR jornada_id = 0)
+        """, (jid, start_date, end_date))
+
+    conn.commit()
+    conn.close()
+    return jid
+
+
+def get_season_jornadas(season_id: int, db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT * FROM jornadas WHERE season_id = ? ORDER BY id ASC", (season_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_jornada(jornada_id: int, db_path: str = DB_PATH) -> Optional[dict]:
+    conn = get_connection(db_path)
+    row = conn.execute("SELECT * FROM jornadas WHERE id = ?", (jornada_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def link_match_to_jornada(match_id: int, jornada_id: int, db_path: str = DB_PATH):
+    conn = get_connection(db_path)
+    conn.execute("INSERT OR IGNORE INTO jornada_matches (jornada_id, match_id) VALUES (?, ?)",
+                 (jornada_id, match_id))
+    conn.execute("UPDATE matches SET jornada_id = ? WHERE id = ?", (jornada_id, match_id))
+    conn.commit()
+    conn.close()
+
+
+def get_jornada_matches(jornada_id: int, db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute("""
+        SELECT m.* FROM matches m
+        JOIN jornada_matches jm ON jm.match_id = m.id
+        WHERE jm.jornada_id = ?
+        ORDER BY m.timestamp ASC
+    """, (jornada_id,)).fetchall()
+    conn.close()
+    return [_parse_match_row(r) for r in rows]
+
+
+def get_jornada_player_ids(jornada_id: int, db_path: str = DB_PATH) -> set[int]:
+    """Get all player IDs who participated in a jornada."""
+    matches = get_jornada_matches(jornada_id, db_path)
+    pids = set()
+    for m in matches:
+        pids.update(m["team_blue"])
+        pids.update(m["team_red"])
+    return pids
+
+
+def close_jornada(jornada_id: int, all_active_player_ids: list[int], db_path: str = DB_PATH) -> dict:
+    """
+    Close a jornada: apply inactivity decay to absent players.
+    Returns dict of {player_id: decay_amount} for players who were penalized.
+    """
+    from elo import EloCalculator
+
+    conn = get_connection(db_path)
+
+    # Mark jornada as closed
+    conn.execute("UPDATE jornadas SET closed = 1 WHERE id = ?", (jornada_id,))
+
+    # Find who played
+    participated = get_jornada_player_ids(jornada_id, db_path)
+
+    decay_results = {}
+    for pid in all_active_player_ids:
+        player = get_player(pid, db_path)
+        if not player:
+            continue
+
+        if pid in participated:
+            # Reset ausencias counter
+            conn.execute("UPDATE players SET ausencias_consecutivas = 0 WHERE id = ?", (pid,))
+        else:
+            # Increment ausencias
+            new_ausencias = player.get("ausencias_consecutivas", 0) + 1
+            elo_inicio = player.get("elo_inicio_temporada") or player["tournament_elo"]
+            current_elo = player["tournament_elo"]
+
+            penalty = EloCalculator.compute_decay(new_ausencias, elo_inicio, current_elo)
+            new_elo = current_elo - penalty
+
+            conn.execute("""
+                UPDATE players SET
+                    ausencias_consecutivas = ?,
+                    tournament_elo = ?,
+                    is_inactive = CASE WHEN ? >= 3 THEN 1 ELSE 0 END
+                WHERE id = ?
+            """, (new_ausencias, new_elo, new_ausencias, pid))
+
+            if penalty > 0:
+                decay_results[pid] = penalty
+
+    conn.commit()
+    conn.close()
+    return decay_results
+
+
+def update_player_streaks(player_id: int, won: bool, db_path: str = DB_PATH):
+    """Update win/loss streak counters after a match."""
+    conn = get_connection(db_path)
+    if won:
+        conn.execute("""
+            UPDATE players SET
+                win_streak = win_streak + 1,
+                loss_streak = 0,
+                best_win_streak = MAX(best_win_streak, win_streak + 1)
+            WHERE id = ?
+        """, (player_id,))
+    else:
+        conn.execute("""
+            UPDATE players SET
+                win_streak = 0,
+                loss_streak = loss_streak + 1
+            WHERE id = ?
+        """, (player_id,))
+    conn.commit()
+    conn.close()
+
+
+def reset_player_streaks(player_id: int, db_path: str = DB_PATH):
+    """Reset streak counters (used during recalculation)."""
+    conn = get_connection(db_path)
+    conn.execute("UPDATE players SET win_streak = 0, loss_streak = 0 WHERE id = ?", (player_id,))
+    conn.commit()
+    conn.close()
+
+
+def save_season_award(season_id: int, award_type: str,
+                      winner_player_id: Optional[int] = None,
+                      player_a_id: Optional[int] = None,
+                      player_b_id: Optional[int] = None,
+                      value: Optional[float] = None,
+                      extra: Optional[dict] = None,
+                      db_path: str = DB_PATH) -> int:
+    conn = get_connection(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO season_awards (season_id, award_type, winner_player_id, player_a_id, player_b_id, value, extra)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (season_id, award_type, winner_player_id, player_a_id, player_b_id, value,
+          json.dumps(extra or {})))
+    aid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return aid
+
+
+def get_season_awards(season_id: int, db_path: str = DB_PATH) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT * FROM season_awards WHERE season_id = ? ORDER BY id ASC", (season_id,)
+    ).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["extra"] = json.loads(d["extra"])
+        result.append(d)
+    return result
+
+
+def delete_season_awards(season_id: int, db_path: str = DB_PATH):
+    """Delete all awards for a season (before recomputing)."""
+    conn = get_connection(db_path)
+    conn.execute("DELETE FROM season_awards WHERE season_id = ?", (season_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_season_match_ids(season_id: int, db_path: str = DB_PATH) -> list[int]:
+    """Get all match IDs that belong to jornadas in this season."""
+    conn = get_connection(db_path)
+    rows = conn.execute("""
+        SELECT jm.match_id FROM jornada_matches jm
+        JOIN jornadas j ON j.id = jm.jornada_id
+        WHERE j.season_id = ?
+        ORDER BY jm.match_id ASC
+    """, (season_id,)).fetchall()
+    conn.close()
+    return [r["match_id"] for r in rows]
 
 
 # ── 1v1 Duel System ───────────────────────────────────────────────────────

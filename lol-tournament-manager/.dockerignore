@@ -1,0 +1,11 @@
+node_modules
+frontend/node_modules
+static*
+__pycache__
+*.pyc
+.git
+.env
+*.db
+*.sqlite
+*.mjs
+frontend/vite.config.js.timestamp-*

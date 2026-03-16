@@ -117,7 +117,7 @@ export default function MatchPage() {
         </div>
 
         <div className="glass p-6">
-          <h2 className="text-sm font-semibold text-surface-400 uppercase tracking-wider mb-4">Elo Changes (v2)</h2>
+          <h2 className="text-sm font-semibold text-surface-400 uppercase tracking-wider mb-4">Elo Changes (v3)</h2>
           <div className="space-y-3">
             {result.elo_changes.map(ec => (
               <div key={ec.player_id} className="bg-surface-800/50 rounded-xl p-4">
@@ -148,12 +148,14 @@ export default function MatchPage() {
                       Perf: {ec.performance_mod > 0 ? '+' : ''}{ec.performance_mod?.toFixed(1)}
                     </span>
                   )}
-                  {ec.activity_bonus !== 0 && (
-                    <span className={`text-[11px] px-2 py-0.5 rounded font-mono ${
-                      ec.activity_bonus > 0 ? 'bg-blue-500/15 text-blue-400' : 'bg-red-500/15 text-red-400'
-                    }`}>
-                      <Activity size={10} className="inline mr-1" />
-                      Activity: {ec.activity_bonus > 0 ? '+' : ''}{ec.activity_bonus?.toFixed(0)}
+                  {ec.k_used && (
+                    <span className="text-[11px] px-2 py-0.5 rounded font-mono bg-surface-700/50 text-surface-400">
+                      K:{ec.k_used}
+                    </span>
+                  )}
+                  {ec.streak_multiplier && ec.streak_multiplier !== 1 && (
+                    <span className="text-[11px] px-2 py-0.5 rounded font-mono bg-orange-500/15 text-orange-400">
+                      🔥×{ec.streak_multiplier}
                     </span>
                   )}
                   {ec.award_bonus !== 0 && (
@@ -170,9 +172,9 @@ export default function MatchPage() {
 
         {/* Elo Formula Note */}
         <div className="glass-sm p-4 text-xs text-surface-400 space-y-1">
-          <p className="font-semibold text-surface-300">Elo v2 Formula</p>
-          <p className="font-mono">delta = clamp(base + performance + activity + award, -28, +28)</p>
-          <p>K=24 · Performance ≤ 20% of base · MVP +2 · ACE +1</p>
+          <p className="font-semibold text-surface-300">Elo v3 Formula</p>
+          <p className="font-mono">delta = clamp(base × contribution × streak + award, -35, +35)</p>
+          <p>Dynamic K (40/16/12/24) · Role-based performance · MVP +2 · ACE +1</p>
         </div>
 
         <div className="flex justify-center gap-3">
@@ -247,10 +249,11 @@ export default function MatchPage() {
                     <p className="text-[11px] text-surface-500 truncate">{p.lol_name_tag}</p>
                     <div className="flex items-center gap-2 mt-1">
                       <p className="text-xs font-mono text-surface-300">Elo {Math.round(p.tournament_elo)}</p>
-                      {p.activity_bonus !== undefined && p.activity_bonus !== 0 && (
-                        <span className={`text-[10px] font-mono ${p.activity_bonus > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {p.activity_bonus > 0 ? '+' : ''}{p.activity_bonus}
-                        </span>
+                      {(p.win_streak || 0) >= 3 && (
+                        <span className="text-[10px] font-mono text-emerald-400">🔥{p.win_streak}W</span>
+                      )}
+                      {(p.loss_streak || 0) >= 3 && (
+                        <span className="text-[10px] font-mono text-red-400">❄️{p.loss_streak}L</span>
                       )}
                     </div>
                   </button>
@@ -275,16 +278,28 @@ export default function MatchPage() {
       {step === 1 && splits && (
         <div className="space-y-6">
           <p className="text-sm text-surface-400">
-            Top 3 most balanced team combinations. Pick the one you prefer.
+            Snake Draft recommendation + balanced alternatives. Pick the one you prefer.
           </p>
           {splits.map((s, idx) => (
-            <div key={idx} className="glass p-5 space-y-4">
+            <div key={idx} className={`glass p-5 space-y-4 ${s.recommended ? 'border-accent/40 ring-1 ring-accent/20' : ''}`}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <span className="text-sm font-semibold text-white">Option {idx + 1}</span>
+                  {s.recommended ? (
+                    <span className="text-sm font-semibold text-accent flex items-center gap-1.5">
+                      <Zap size={14} /> Snake Draft
+                      <span className="text-[10px] bg-accent/20 text-accent px-1.5 py-0.5 rounded-full ml-1">Recommended</span>
+                    </span>
+                  ) : (
+                    <span className="text-sm font-semibold text-surface-300">Alternative {idx}</span>
+                  )}
                   <span className="text-xs font-mono px-2 py-0.5 rounded bg-surface-800 text-surface-300">
                     Elo diff: {s.elo_diff}
                   </span>
+                  {s.warning && (
+                    <span className="text-[10px] text-yellow-400 bg-yellow-500/10 px-1.5 py-0.5 rounded">
+                      ⚠️ {s.warning}
+                    </span>
+                  )}
                 </div>
                 <button onClick={() => handleChooseSplit(s)} className="btn-primary text-sm py-1.5">
                   Select

@@ -1,13 +1,14 @@
 """
-FastAPI backend for LoL Tournament Manager – v2.
+FastAPI backend for LoL Tournament Manager – v3.
 Run with:  python3 -m uvicorn api:app --reload --port 8000
 
-New in v2:
-  - Riot tournament-v5 / tournament-stub-v5 integration
-  - match-v5 auto-stats (callback → fetch → Elo)
-  - Data Dragon champion catalog
-  - Performance-weighted Elo with activity bonus
-  - Power ranking = Elo + activity adjustment
+v3:
+  - Dynamic K-factor (calibration/high-elo/upset/standard)
+  - Role-based performance scoring (TOP/JNG/MID/ADC/SUP/TANK)
+  - Snake draft team balancing (primary) + brute-force (fallback)
+  - Streak bonuses (win streak ×1.10, loss streak K ×1.2)
+  - Jornada-based inactivity decay (seasons/jornadas system)
+  - Season awards computation
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ log = logging.getLogger(__name__)
 db.init_db()
 seed_players()
 
-app = FastAPI(title="LoL Tournament Manager API", version="2.0.0")
+app = FastAPI(title="LoL Tournament Manager API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,7 +54,7 @@ balancer = MatchBalancer()
 
 # Try latest build dir first, fall back to older ones
 _base = os.path.dirname(os.path.abspath(__file__))
-_candidates = ["static9", "static8", "static7", "static6", "static5", "static4", "static3", "static2", "static"]
+_candidates = ["static13", "static12", "static11", "static10", "static9", "static8", "static7", "static6", "static5", "static4", "static3", "static2", "static"]
 STATIC_DIR = next(
     (os.path.join(_base, d) for d in _candidates if os.path.isdir(os.path.join(_base, d))),
     os.path.join(_base, "static"),
@@ -73,6 +74,7 @@ class AddPlayerRequest(BaseModel):
 
 class GenerateTeamsRequest(BaseModel):
     player_ids: list[int]
+    method: str = "snake"  # "snake" (default) or "brute_force"
 
 
 class CreateMatchRequest(BaseModel):
@@ -218,11 +220,8 @@ def test_riot_key():
 @app.get("/api/players")
 def list_players(active_only: bool = True):
     players = db.get_all_players(active_only=active_only)
-    # Enrich with activity bonus for power ranking
     for p in players:
-        activity = elo_calc.compute_activity_bonus(p.get("last_played"))
-        p["activity_bonus"] = activity
-        p["power_ranking"] = round(p["tournament_elo"] + activity, 2)
+        p["power_ranking"] = round(p["tournament_elo"], 2)
     return players
 
 
@@ -231,9 +230,7 @@ def get_player(player_id: int):
     p = db.get_player(player_id)
     if not p:
         raise HTTPException(404, "Player not found")
-    activity = elo_calc.compute_activity_bonus(p.get("last_played"))
-    p["activity_bonus"] = activity
-    p["power_ranking"] = round(p["tournament_elo"] + activity, 2)
+    p["power_ranking"] = round(p["tournament_elo"], 2)
     return p
 
 
@@ -245,7 +242,7 @@ def add_player(req: AddPlayerRequest):
 
     if req.use_api:
         riot_data = fetch_player_rank(req.lol_name_tag)
-        if riot_data:
+        if riot_data and "error" not in riot_data:
             api_elo = riot_data["elo"]
             # Also try to get PUUID
             try:
@@ -284,9 +281,12 @@ def riot_lookup(req: RiotLookupRequest):
     except ValueError:
         raise HTTPException(400, "Invalid format. Use Name#Tag")
 
-    rank = fetch_player_rank(req.lol_name_tag)
-    if rank:
-        return {"found": True, "rank": rank}
+    result = fetch_player_rank(req.lol_name_tag)
+    if result and "error" in result:
+        # API returned an error message — pass it to frontend
+        return {"found": False, "rank": None, "message": result["error"]}
+    if result and "tier" in result:
+        return {"found": True, "rank": result}
     return {"found": False, "rank": None,
             "message": "Could not reach Riot API or player not found. You can still add manually."}
 
@@ -316,13 +316,11 @@ def player_stats(player_id: int):
         raise HTTPException(404, "Player not found")
     champ_stats = db.get_player_champion_stats(player_id)
     elo_history = db.get_player_elo_history(player_id)
-    activity = elo_calc.compute_activity_bonus(p.get("last_played"))
     return {
         "player": p,
         "champion_stats": champ_stats,
         "elo_history": elo_history,
-        "activity_bonus": activity,
-        "power_ranking": round(p["tournament_elo"] + activity, 2),
+        "power_ranking": round(p["tournament_elo"], 2),
     }
 
 
@@ -335,8 +333,9 @@ def player_elo_history(player_id: int):
 
 @app.post("/api/matchmaking/generate")
 def generate_teams(req: GenerateTeamsRequest):
-    if len(req.player_ids) != 10:
-        raise HTTPException(400, "Exactly 10 player IDs required")
+    n = len(req.player_ids)
+    if n not in (10, 20):
+        raise HTTPException(400, "Exactly 10 or 20 player IDs required")
 
     players = []
     for pid in req.player_ids:
@@ -345,7 +344,11 @@ def generate_teams(req: GenerateTeamsRequest):
             raise HTTPException(404, f"Player {pid} not found")
         players.append(p)
 
-    splits = balancer.all_splits_sorted(players, top_n=3)
+    try:
+        splits = balancer.generate_teams(players, method=req.method)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     results = []
     for s in splits:
         results.append({
@@ -354,6 +357,8 @@ def generate_teams(req: GenerateTeamsRequest):
             "avg_blue_elo": s.avg_blue_elo,
             "avg_red_elo": s.avg_red_elo,
             "elo_diff": s.elo_diff,
+            "warning": s.warning,
+            "recommended": s.recommended,
         })
     return results
 
@@ -398,25 +403,16 @@ def create_match(req: CreateMatchRequest):
     if any(p is None for p in blue_players + red_players):
         raise HTTPException(404, "One or more players not found")
 
-    avg_b = sum(p["tournament_elo"] for p in blue_players) / 5
-    avg_r = sum(p["tournament_elo"] for p in red_players) / 5
+    avg_b = sum(p["tournament_elo"] for p in blue_players) / len(blue_players)
+    avg_r = sum(p["tournament_elo"] for p in red_players) / len(red_players)
 
-    # Resolve with new Elo v2 (no performances in manual mode)
+    # Resolve with Elo v3 (no performances in manual mode)
     results = elo_calc.resolve_match(
         blue_players, red_players, req.winner,
         mvp_id=req.mvp_player_id, ace_id=req.ace_player_id,
     )
 
-    elo_changes = {}
-    for r in results:
-        elo_changes[str(r.player_id)] = {
-            "delta": r.delta,
-            "delta_base": r.delta_base,
-            "performance_mod": r.performance_mod,
-            "activity_bonus": r.activity_bonus,
-            "award_bonus": r.award_bonus,
-            "performance_score": r.performance_score,
-        }
+    elo_changes = _build_elo_changes(results)
 
     match_id = db.save_match(
         req.team_blue, req.team_red, avg_b, avg_r,
@@ -426,15 +422,12 @@ def create_match(req: CreateMatchRequest):
         elo_changes, timestamp=req.timestamp,
     )
 
-    winning_ids = req.team_blue if req.winner == "Blue" else req.team_red
+    winning_ids = set(req.team_blue if req.winner == "Blue" else req.team_red)
     for r in results:
+        won = r.player_id in winning_ids
         db.update_player_elo(r.player_id, r.elo_after)
-        db.update_player_stats(
-            r.player_id,
-            won=(r.player_id in winning_ids),
-            is_mvp=r.is_mvp,
-            is_ace=r.is_ace,
-        )
+        db.update_player_stats(r.player_id, won=won, is_mvp=r.is_mvp, is_ace=r.is_ace)
+        db.update_player_streaks(r.player_id, won=won)
         db.save_elo_snapshot(r.player_id, match_id, r.elo_before, r.elo_after)
 
     all_picks = list(zip(req.team_blue, req.picks_blue)) + list(zip(req.team_red, req.picks_red))
@@ -453,17 +446,36 @@ def create_match(req: CreateMatchRequest):
             "delta": r.delta,
             "delta_base": r.delta_base,
             "performance_mod": r.performance_mod,
-            "activity_bonus": r.activity_bonus,
             "award_bonus": r.award_bonus,
             "performance_score": r.performance_score,
             "is_mvp": r.is_mvp,
             "is_ace": r.is_ace,
+            "k_used": r.k_used,
+            "contribution_factor": r.contribution_factor,
+            "streak_multiplier": r.streak_multiplier,
         })
 
     return {
         "match_id": match_id,
         "elo_changes": elo_details,
     }
+
+
+def _build_elo_changes(results) -> dict:
+    """Build the elo_changes dict from EloResult list (v3 format)."""
+    elo_changes = {}
+    for r in results:
+        elo_changes[str(r.player_id)] = {
+            "delta": r.delta,
+            "delta_base": r.delta_base,
+            "performance_mod": r.performance_mod,
+            "award_bonus": r.award_bonus,
+            "performance_score": r.performance_score,
+            "k_used": r.k_used,
+            "contribution_factor": r.contribution_factor,
+            "streak_multiplier": r.streak_multiplier,
+        }
+    return elo_changes
 
 
 # ── Historical Match (add past match + full Elo recalc) ────────────────────
@@ -511,6 +523,7 @@ def _recalculate_all_elo(starting_elos: dict[int, float]):
     """
     Reset all stats and replay every non-archived match chronologically.
     This ensures Elo is consistent when matches are inserted out of order.
+    Uses v3 Elo system with streak tracking.
     """
     # 1) Reset everything to starting state
     db.reset_all_for_recalc(starting_elos)
@@ -527,37 +540,28 @@ def _recalculate_all_elo(starting_elos: dict[int, float]):
 
         winning_ids = set(m["team_blue"] if winner == "Blue" else m["team_red"])
 
-        # Get current player state (Elo has been accumulating match by match)
+        # Get current player state (Elo + streaks accumulate match by match)
         blue_players = [db.get_player(pid) for pid in m["team_blue"]]
         red_players = [db.get_player(pid) for pid in m["team_red"]]
 
         if any(p is None for p in blue_players + red_players):
             continue
 
-        # Recalculate Elo
+        # Recalculate Elo (v3 - uses games_played, win_streak, loss_streak from player dicts)
         results = elo_calc.resolve_match(
             blue_players, red_players, winner,
             mvp_id=m.get("mvp_player_id"), ace_id=m.get("ace_player_id"),
         )
 
-        # Build elo_changes
-        elo_changes = {}
-        for r in results:
-            elo_changes[str(r.player_id)] = {
-                "delta": r.delta,
-                "delta_base": r.delta_base,
-                "performance_mod": r.performance_mod,
-                "activity_bonus": r.activity_bonus,
-                "award_bonus": r.award_bonus,
-                "performance_score": r.performance_score,
-            }
+        # Build elo_changes (v3 format)
+        elo_changes = _build_elo_changes(results)
 
         # Update match elo_changes
         db.update_match_elo_changes(mid, elo_changes)
 
         # Update avg elo (current state)
-        avg_b = sum(p["tournament_elo"] for p in blue_players) / 5
-        avg_r = sum(p["tournament_elo"] for p in red_players) / 5
+        avg_b = sum(p["tournament_elo"] for p in blue_players) / len(blue_players)
+        avg_r = sum(p["tournament_elo"] for p in red_players) / len(red_players)
         conn = db.get_connection()
         conn.execute(
             "UPDATE matches SET avg_blue_elo = ?, avg_red_elo = ? WHERE id = ?",
@@ -566,17 +570,17 @@ def _recalculate_all_elo(starting_elos: dict[int, float]):
         conn.commit()
         conn.close()
 
-        # Apply Elo and stats
+        # Apply Elo, stats, and streaks
         match_ts = m.get("timestamp")
         for r in results:
+            won = r.player_id in winning_ids
             db.update_player_elo(r.player_id, r.elo_after)
             db.update_player_stats(
-                r.player_id,
-                won=(r.player_id in winning_ids),
-                is_mvp=r.is_mvp,
-                is_ace=r.is_ace,
+                r.player_id, won=won,
+                is_mvp=r.is_mvp, is_ace=r.is_ace,
                 timestamp=match_ts,
             )
+            db.update_player_streaks(r.player_id, won=won)
             db.save_elo_snapshot(r.player_id, mid, r.elo_before, r.elo_after)
 
         # Champion stats
@@ -659,33 +663,21 @@ def restore_match(match_id: int):
     if any(p is None for p in blue_players + red_players):
         raise HTTPException(400, "One or more players no longer exist")
 
-    # Re-run Elo calculation
+    # Re-run Elo calculation (v3)
     results = elo_calc.resolve_match(
         blue_players, red_players, winner,
         mvp_id=m.get("mvp_player_id"), ace_id=m.get("ace_player_id"),
     )
 
     # Apply results
-    elo_changes = {}
-    for r in results:
-        elo_changes[str(r.player_id)] = {
-            "delta": r.delta,
-            "delta_base": r.delta_base,
-            "performance_mod": r.performance_mod,
-            "activity_bonus": r.activity_bonus,
-            "award_bonus": r.award_bonus,
-            "performance_score": r.performance_score,
-        }
+    elo_changes = _build_elo_changes(results)
 
-    # Update Elo, stats, history
+    # Update Elo, stats, streaks, history
     for r in results:
+        won = r.player_id in winning_ids
         db.update_player_elo(r.player_id, r.elo_after)
-        db.update_player_stats(
-            r.player_id,
-            won=(r.player_id in winning_ids),
-            is_mvp=r.is_mvp,
-            is_ace=r.is_ace,
-        )
+        db.update_player_stats(r.player_id, won=won, is_mvp=r.is_mvp, is_ace=r.is_ace)
+        db.update_player_streaks(r.player_id, won=won)
         db.save_elo_snapshot(r.player_id, match_id, r.elo_before, r.elo_after)
 
     # Re-apply champion stats
@@ -907,9 +899,13 @@ def _auto_resolve_match(match: dict, match_data: dict, riot_match_id: str):
             deaths=part.deaths,
             assists=part.assists,
             total_damage_to_champions=part.total_damage_to_champions,
+            total_damage_taken=getattr(part, "total_damage_taken", 0),
+            damage_mitigated=getattr(part, "damage_mitigated", 0),
             vision_score=part.vision_score,
             cs=part.cs,
             gold_earned=part.gold_earned,
+            role=getattr(part, "role", ""),
+            game_duration_minutes=parsed.get("game_duration", 1500) / 60.0,
         )
         performances[pid] = perf
 
@@ -957,16 +953,7 @@ def _auto_resolve_match(match: dict, match_data: dict, riot_match_id: str):
         performances=performances,
     )
 
-    elo_changes = {}
-    for r in results:
-        elo_changes[str(r.player_id)] = {
-            "delta": r.delta,
-            "delta_base": r.delta_base,
-            "performance_mod": r.performance_mod,
-            "activity_bonus": r.activity_bonus,
-            "award_bonus": r.award_bonus,
-            "performance_score": r.performance_score,
-        }
+    elo_changes = _build_elo_changes(results)
 
     # Update match
     db.update_match_result(
@@ -976,15 +963,12 @@ def _auto_resolve_match(match: dict, match_data: dict, riot_match_id: str):
         duration_seconds=parsed["game_duration"],
     )
 
-    # Update player stats and Elo
+    # Update player stats, Elo, and streaks
     for r in results:
+        won = r.player_id in winning_ids
         db.update_player_elo(r.player_id, r.elo_after)
-        db.update_player_stats(
-            r.player_id,
-            won=(r.player_id in winning_ids),
-            is_mvp=r.is_mvp,
-            is_ace=r.is_ace,
-        )
+        db.update_player_stats(r.player_id, won=won, is_mvp=r.is_mvp, is_ace=r.is_ace)
+        db.update_player_streaks(r.player_id, won=won)
         db.save_elo_snapshot(r.player_id, match_id, r.elo_before, r.elo_after)
 
     # Save individual performances
@@ -1089,19 +1073,11 @@ def stats_overview():
     avg_elo = sum(p["tournament_elo"] for p in players) / len(players) if players else 0
     top = max(players, key=lambda p: p["tournament_elo"]) if players else None
 
-    # Power rankings
-    for p in players:
-        activity = elo_calc.compute_activity_bonus(p.get("last_played"))
-        p["power_ranking"] = round(p["tournament_elo"] + activity, 2)
-
-    top_power = max(players, key=lambda p: p["power_ranking"]) if players else None
-
     return {
         "total_players": len(players),
         "total_matches": len(matches),
         "avg_elo": round(avg_elo, 1),
         "top_player": top,
-        "top_power_player": top_power,
     }
 
 
@@ -1358,31 +1334,341 @@ def duel_overview():
 
 @app.get("/api/elo/formula")
 def elo_formula_info():
-    """Return info about the current Elo formula for the frontend."""
+    """Return info about the current Elo v3 formula for the frontend."""
     return {
-        "version": "v2",
-        "k_factor": elo_calc.K_FACTOR,
-        "clamp": [elo_calc.CLAMP_MIN, elo_calc.CLAMP_MAX],
-        "performance_multiplier": elo_calc.PERF_MULTIPLIER,
+        "version": "v3",
+        "elo_initial": 1200,
+        "elo_range": [600, 2000],
+        "calibration_games": 5,
+        "k_factor": {
+            "calibration": 40,
+            "high_elo_threshold": 1500,
+            "high_elo": 16,
+            "upset_threshold": 200,
+            "upset": 12,
+            "standard": 24,
+            "loss_streak_mult": 1.2,
+        },
         "mvp_bonus": elo_calc.MVP_BONUS,
         "ace_bonus": elo_calc.ACE_BONUS,
-        "catch_up_threshold": elo_calc.CATCH_UP_THRESHOLD,
-        "catch_up_k_mult": elo_calc.CATCH_UP_K_MULT,
-        "performance_weights": {
-            "kda": 0.35,
-            "kill_participation": 0.20,
-            "damage_share": 0.20,
-            "vision_share": 0.15,
-            "cs_gold_share": 0.10,
+        "performance_roles": {
+            "TOP_JNG_MID": "0.40×dmg/min + 0.35×kda + 0.25×obj_part",
+            "ADC": "0.40×dmg/min + 0.35×cs/min + 0.25×kda",
+            "SUPPORT": "0.40×vision/min + 0.35×kill_part + 0.25×dmg_mitigated/min",
+            "TANK": "0.40×dmg_taken/min + 0.35×obj_part + 0.25×kill_part",
         },
-        "activity_bonus": {
-            "14_days": "+2",
-            "30_days": "+1",
-            "45_days": "0",
-            "45_plus": "-2",
+        "contribution_factor": "1.0 + clamp(score × 0.5, -0.3, +0.3) → [0.7, 1.3]",
+        "streaks": {
+            "win_streak_3": "delta × 1.10",
+            "loss_streak_3": "K × 1.2",
         },
-        "formula": "finalDelta = clamp(deltaBase + performanceModifier + activityBonus + awardBonus, -28, +28)",
+        "decay": {
+            "0-2_jornadas": 0,
+            "3-4_jornadas": 8,
+            "5-6_jornadas": 15,
+            "7+_jornadas": 20,
+        },
+        "balancer": "snake_draft",
+        "formula": "delta = K × (S - E) × contribution_factor [× streak_mult] + award_bonus",
     }
+
+
+# ── Seasons & Jornadas ────────────────────────────────────────────────────────
+
+class CreateSeasonRequest(BaseModel):
+    name: str
+    start_date: Optional[str] = None   # YYYY-MM-DD
+    end_date: Optional[str] = None     # YYYY-MM-DD
+
+
+class CreateJornadaRequest(BaseModel):
+    season_id: int
+    name: str = ""
+    start_date: Optional[str] = None   # YYYY-MM-DD
+    end_date: Optional[str] = None     # YYYY-MM-DD
+
+
+class LinkMatchJornadaRequest(BaseModel):
+    match_id: int
+    jornada_id: int
+
+
+@app.get("/api/seasons")
+def list_seasons():
+    return db.get_all_seasons()
+
+
+@app.get("/api/seasons/active")
+def active_season():
+    s = db.get_active_season()
+    if not s:
+        return {"active": False}
+    jornadas = db.get_season_jornadas(s["id"])
+    return {"active": True, "season": s, "jornadas": jornadas}
+
+
+@app.post("/api/seasons")
+def create_season(req: CreateSeasonRequest):
+    sid = db.create_season(req.name, start_date=req.start_date, end_date=req.end_date)
+    return {"season_id": sid, "message": f"Season '{req.name}' created"}
+
+
+@app.post("/api/seasons/{season_id}/close")
+def close_season(season_id: int):
+    s = db.get_season(season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+    db.close_season(season_id)
+    return {"message": f"Season '{s['name']}' closed"}
+
+
+@app.post("/api/jornadas")
+def create_jornada(req: CreateJornadaRequest):
+    s = db.get_season(req.season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+    if s["status"] != "active":
+        raise HTTPException(400, "Season is not active")
+    jid = db.create_jornada(req.season_id, req.name,
+                             start_date=req.start_date, end_date=req.end_date)
+    # Count auto-linked matches
+    j_data = db.get_jornada_matches(jid)
+    auto_count = len(j_data) if j_data else 0
+    msg = f"Jornada created (id={jid})"
+    if auto_count > 0:
+        msg += f". {auto_count} matches auto-linked by date."
+    return {"jornada_id": jid, "auto_linked": auto_count, "message": msg}
+
+
+@app.get("/api/jornadas/{jornada_id}")
+def get_jornada(jornada_id: int):
+    j = db.get_jornada(jornada_id)
+    if not j:
+        raise HTTPException(404, "Jornada not found")
+    matches = db.get_jornada_matches(jornada_id)
+    return {"jornada": j, "matches": matches}
+
+
+@app.post("/api/jornadas/link-match")
+def link_match_to_jornada(req: LinkMatchJornadaRequest):
+    db.link_match_to_jornada(req.match_id, req.jornada_id)
+    return {"message": "Match linked to jornada"}
+
+
+@app.post("/api/jornadas/{jornada_id}/close")
+def close_jornada(jornada_id: int):
+    j = db.get_jornada(jornada_id)
+    if not j:
+        raise HTTPException(404, "Jornada not found")
+    if j["closed"]:
+        raise HTTPException(400, "Jornada already closed")
+
+    active_players = db.get_all_players(active_only=True)
+    active_ids = [p["id"] for p in active_players]
+    decay_results = db.close_jornada(jornada_id, active_ids)
+
+    return {
+        "message": f"Jornada closed. {len(decay_results)} players received decay.",
+        "decay": {str(pid): penalty for pid, penalty in decay_results.items()},
+    }
+
+
+# ── Season Awards ──────────────────────────────────────────────────────────
+
+@app.post("/api/seasons/{season_id}/compute-awards")
+def compute_season_awards(season_id: int):
+    """
+    Compute all season awards (12 individual + 6 duo).
+    Deletes existing awards for this season before recomputing.
+    """
+    s = db.get_season(season_id)
+    if not s:
+        raise HTTPException(404, "Season not found")
+
+    db.delete_season_awards(season_id)
+
+    match_ids = db.get_season_match_ids(season_id)
+    if not match_ids:
+        return {"message": "No matches in this season", "awards": []}
+
+    # Gather all matches
+    season_matches = [db.get_match(mid) for mid in match_ids]
+    season_matches = [m for m in season_matches if m and m.get("winner")]
+
+    # Gather all player stats from those matches
+    player_stats = {}  # pid -> aggregated stats
+    for m in season_matches:
+        winning_ids = set(m["team_blue"] if m["winner"] == "Blue" else m["team_red"])
+        for pid in m["team_blue"] + m["team_red"]:
+            if pid not in player_stats:
+                player_stats[pid] = {
+                    "games": 0, "wins": 0, "losses": 0,
+                    "elo_gained": 0.0, "elo_lost": 0.0,
+                    "mvps": 0, "aces": 0,
+                    "total_delta": 0.0,
+                    "biggest_win_delta": 0.0, "biggest_loss_delta": 0.0,
+                }
+            ps = player_stats[pid]
+            ps["games"] += 1
+            won = pid in winning_ids
+            if won:
+                ps["wins"] += 1
+            else:
+                ps["losses"] += 1
+            if m["mvp_player_id"] == pid:
+                ps["mvps"] += 1
+            if m["ace_player_id"] == pid:
+                ps["aces"] += 1
+
+            ec = m["elo_changes"]
+            delta_data = ec.get(str(pid), {})
+            delta = delta_data.get("delta", 0) if isinstance(delta_data, dict) else 0
+            ps["total_delta"] += delta
+            if won and delta > ps["biggest_win_delta"]:
+                ps["biggest_win_delta"] = delta
+            if not won and delta < ps["biggest_loss_delta"]:
+                ps["biggest_loss_delta"] = delta
+
+    # Duo stats: track every pair that played together
+    duo_stats = {}
+    for m in season_matches:
+        winning_ids = set(m["team_blue"] if m["winner"] == "Blue" else m["team_red"])
+        for team in [m["team_blue"], m["team_red"]]:
+            team_won = set(team) & winning_ids == set(team) if winning_ids else False
+            for i in range(len(team)):
+                for j in range(i + 1, len(team)):
+                    pair = tuple(sorted([team[i], team[j]]))
+                    if pair not in duo_stats:
+                        duo_stats[pair] = {"games": 0, "wins": 0}
+                    duo_stats[pair]["games"] += 1
+                    if team_won:
+                        duo_stats[pair]["wins"] += 1
+
+    awards = []
+
+    def _award(award_type, pid=None, pa=None, pb=None, value=None, extra=None):
+        aid = db.save_season_award(season_id, award_type, pid, pa, pb, value, extra)
+        awards.append({"id": aid, "type": award_type, "player_id": pid, "value": value})
+
+    # Filter players with minimum games
+    min_games = 3
+    qualified = {pid: s for pid, s in player_stats.items() if s["games"] >= min_games}
+
+    if qualified:
+        # 1. MVP de la Temporada (most Elo gained)
+        best = max(qualified.items(), key=lambda x: x[1]["total_delta"])
+        _award("mvp_temporada", pid=best[0], value=round(best[1]["total_delta"], 2))
+
+        # 2. Máximo Ganador (highest win rate, min games)
+        best_wr = max(qualified.items(), key=lambda x: x[1]["wins"] / max(x[1]["games"], 1))
+        wr = round(best_wr[1]["wins"] / max(best_wr[1]["games"], 1) * 100, 1)
+        _award("max_ganador", pid=best_wr[0], value=wr,
+               extra={"wins": best_wr[1]["wins"], "games": best_wr[1]["games"]})
+
+        # 3. El Resiliente (best comeback – most Elo gained from negative)
+        # Player who had the biggest Elo recovery
+        best_resilient = max(qualified.items(), key=lambda x: x[1]["total_delta"] if x[1]["losses"] > 0 else -9999)
+        if best_resilient[1]["losses"] > 0:
+            _award("resiliente", pid=best_resilient[0], value=round(best_resilient[1]["total_delta"], 2))
+
+        # 4. Iron Wall (lowest Elo loss, most consistent)
+        least_lost = min(qualified.items(), key=lambda x: abs(x[1]["biggest_loss_delta"]))
+        _award("iron_wall", pid=least_lost[0], value=round(least_lost[1]["biggest_loss_delta"], 2))
+
+        # 5. El Clutch (biggest single-game Elo gain)
+        best_clutch = max(qualified.items(), key=lambda x: x[1]["biggest_win_delta"])
+        _award("clutch", pid=best_clutch[0], value=round(best_clutch[1]["biggest_win_delta"], 2))
+
+        # 6. MVP Machine (most MVPs)
+        best_mvp = max(qualified.items(), key=lambda x: x[1]["mvps"])
+        if best_mvp[1]["mvps"] > 0:
+            _award("mvp_machine", pid=best_mvp[0], value=best_mvp[1]["mvps"])
+
+        # 7. ACE Master (most ACEs)
+        best_ace = max(qualified.items(), key=lambda x: x[1]["aces"])
+        if best_ace[1]["aces"] > 0:
+            _award("ace_master", pid=best_ace[0], value=best_ace[1]["aces"])
+
+        # 8. El Veterano (most games played)
+        most_games = max(qualified.items(), key=lambda x: x[1]["games"])
+        _award("veterano", pid=most_games[0], value=most_games[1]["games"])
+
+        # 9. Rising Star (most Elo gained per game)
+        best_per_game = max(qualified.items(), key=lambda x: x[1]["total_delta"] / max(x[1]["games"], 1))
+        _award("rising_star", pid=best_per_game[0],
+               value=round(best_per_game[1]["total_delta"] / max(best_per_game[1]["games"], 1), 2))
+
+        # 10. El Desafortunado (worst Elo loss overall)
+        worst = min(qualified.items(), key=lambda x: x[1]["total_delta"])
+        if worst[1]["total_delta"] < 0:
+            _award("desafortunado", pid=worst[0], value=round(worst[1]["total_delta"], 2))
+
+        # 11. Highest Elo Peak
+        # Look at elo_history for max elo_after during season matches
+        best_peak = None
+        best_peak_val = 0
+        for pid in qualified:
+            for mid in match_ids:
+                entries = db.get_elo_history_for_match(mid)
+                for e in entries:
+                    if e["player_id"] == pid and e["elo_after"] > best_peak_val:
+                        best_peak_val = e["elo_after"]
+                        best_peak = pid
+        if best_peak:
+            _award("highest_peak", pid=best_peak, value=round(best_peak_val, 2))
+
+        # 12. Most Improved (biggest Elo difference start vs end of season)
+        for pid in qualified:
+            p = db.get_player(pid)
+            if p and p.get("elo_inicio_temporada"):
+                improvement = p["tournament_elo"] - p["elo_inicio_temporada"]
+                if not hasattr(compute_season_awards, '_best_improved') or improvement > compute_season_awards._best_improved_val:
+                    compute_season_awards._best_improved = pid
+                    compute_season_awards._best_improved_val = improvement
+        if hasattr(compute_season_awards, '_best_improved'):
+            _award("most_improved", pid=compute_season_awards._best_improved,
+                   value=round(compute_season_awards._best_improved_val, 2))
+            del compute_season_awards._best_improved
+            del compute_season_awards._best_improved_val
+
+    # Duo awards (min 2 games together)
+    qualified_duos = {pair: s for pair, s in duo_stats.items() if s["games"] >= 2}
+    if qualified_duos:
+        # 1. Best Duo (highest win rate)
+        best_duo = max(qualified_duos.items(), key=lambda x: x[1]["wins"] / max(x[1]["games"], 1))
+        wr = round(best_duo[1]["wins"] / max(best_duo[1]["games"], 1) * 100, 1)
+        _award("best_duo", pa=best_duo[0][0], pb=best_duo[0][1], value=wr,
+               extra={"wins": best_duo[1]["wins"], "games": best_duo[1]["games"]})
+
+        # 2. Most Games Together
+        most_together = max(qualified_duos.items(), key=lambda x: x[1]["games"])
+        _award("most_games_duo", pa=most_together[0][0], pb=most_together[0][1],
+               value=most_together[1]["games"])
+
+        # 3. Worst Duo (lowest win rate, min 2 games)
+        worst_duo = min(qualified_duos.items(), key=lambda x: x[1]["wins"] / max(x[1]["games"], 1))
+        wr = round(worst_duo[1]["wins"] / max(worst_duo[1]["games"], 1) * 100, 1)
+        _award("worst_duo", pa=worst_duo[0][0], pb=worst_duo[0][1], value=wr,
+               extra={"wins": worst_duo[1]["wins"], "games": worst_duo[1]["games"]})
+
+    return {"message": f"Computed {len(awards)} awards", "awards": awards}
+
+
+@app.get("/api/seasons/{season_id}/awards")
+def get_season_awards(season_id: int):
+    awards = db.get_season_awards(season_id)
+    # Enrich with player names
+    for a in awards:
+        if a.get("winner_player_id"):
+            p = db.get_player(a["winner_player_id"])
+            a["winner_name"] = p["name"] if p else "Unknown"
+        if a.get("player_a_id"):
+            p = db.get_player(a["player_a_id"])
+            a["player_a_name"] = p["name"] if p else "Unknown"
+        if a.get("player_b_id"):
+            p = db.get_player(a["player_b_id"])
+            a["player_b_name"] = p["name"] if p else "Unknown"
+    return awards
 
 
 # ── Serve React Frontend ─────────────────────────────────────────────────────
